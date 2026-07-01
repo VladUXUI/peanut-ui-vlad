@@ -226,9 +226,11 @@ if (process.env.NODE_ENV !== 'development' && !Boolean(process.env.LOCAL_BUILD))
         // Upload a larger set of source maps for prettier stack traces (increases build time)
         widenClientFileUpload: true,
 
-        // Automatically annotate React components to show their full name in breadcrumbs and session replay
+        // Automatically annotate React components to show their full name in breadcrumbs and session replay.
+        // Disabled: the injected data-sentry-* props crash Headless UI components that render as a Fragment
+        // (e.g. <Listbox> in Global/Select), which breaks the design-audit page in production builds.
         reactComponentAnnotation: {
-            enabled: true,
+            enabled: false,
         },
 
         // Uncomment to route browser requests to Sentry through a Next.js rewrite to circumvent ad-blockers.
