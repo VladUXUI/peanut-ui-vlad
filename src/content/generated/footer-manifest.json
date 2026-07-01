@@ -1,1 +1,7 @@
-{"footer": []}
+{
+    "sendMoney": { "to": [], "from": [] },
+    "compare": [],
+    "resources": [],
+    "articles": [],
+    "footer": []
+}
