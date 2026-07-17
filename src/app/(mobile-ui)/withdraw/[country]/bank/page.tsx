@@ -8,49 +8,57 @@ import InfoCard from '@/components/Global/InfoCard'
 import NavHeader from '@/components/Global/NavHeader'
 import PeanutActionDetailsCard from '@/components/Global/PeanutActionDetailsCard'
 import { PaymentInfoRow } from '@/components/Payment/PaymentInfoRow'
-import {
-    PEANUT_WALLET_CHAIN,
-    PEANUT_WALLET_TOKEN_SYMBOL,
-    PEANUT_WALLET_TOKEN_DECIMALS,
-} from '@/constants/zerodev.consts'
+import { PEANUT_WALLET_CHAIN, PEANUT_WALLET_TOKEN_SYMBOL } from '@/constants/zerodev.consts'
 import { useWithdrawFlow } from '@/context/WithdrawFlowContext'
 import { useWallet } from '@/hooks/wallet/useWallet'
 import { usePendingTransactions } from '@/hooks/wallet/usePendingTransactions'
 import { AccountType, type Account } from '@/interfaces'
 import { formatIban, shortenStringLong, isTxReverted } from '@/utils/general.utils'
 import { useParams, useRouter, useSearchParams } from 'next/navigation'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { TRANSACTIONS } from '@/constants/query.consts'
 import PaymentSuccessView from '@/features/payments/shared/components/PaymentSuccessView'
 import { ErrorHandler } from '@/utils/friendly-error.utils'
+import { INSUFFICIENT_BALANCE_MESSAGE, isAmountWithinBalance } from '@/utils/balance.utils'
 import { getBridgeChainName } from '@/utils/bridge-accounts.utils'
-import { getOfframpCurrencyConfig, getCountryFromPath } from '@/utils/bridge.utils'
+import { getOfframpConfigFromAccount, getCountryFromPath, railJurisdictionForBank } from '@/utils/bridge.utils'
 import { createOfframp, confirmOfframp } from '@/app/actions/offramp'
 import { useAuth } from '@/context/authContext'
-import { useBridgeTosGuard } from '@/hooks/useBridgeTosGuard'
+import { useTosGuard } from '@/hooks/useTosGuard'
 import { BridgeTosStep } from '@/components/Kyc/BridgeTosStep'
 import { useMultiPhaseKycFlow } from '@/hooks/useMultiPhaseKycFlow'
 import { SumsubKycModals } from '@/components/Kyc/SumsubKycModals'
+import { KycReverificationPendingModal } from '@/components/Kyc/KycReverificationPendingModal'
+import { useWaitingOnProviderModal } from '@/hooks/useWaitingOnProviderModal'
 import { InitiateKycModal } from '@/components/Kyc/InitiateKycModal'
-import {
-    useBridgeTransferReadiness,
-    getKycModalVariant,
-    getGateProviderMessage,
-} from '@/hooks/useBridgeTransferReadiness'
+import AdvisoryPreemptModal from '@/components/Kyc/AdvisoryPreemptModal'
+import { useAdvisoryPreempt } from '@/hooks/useAdvisoryPreempt'
+import { useEeaUpliftFunnel } from '@/hooks/useEeaUpliftFunnel'
+import { upliftTriggerFromGate, upliftTriggerFromAdvisory } from '@/utils/eea-uplift.utils'
+import { useCapabilities } from '@/hooks/useCapabilities'
+import { getKycModalVariant, getGateUserMessage } from '@/utils/capability-gate'
 import { useModalsContext } from '@/context/ModalsContext'
 import ExchangeRate from '@/components/ExchangeRate'
 import countryCurrencyMappings, { isNonEuroSepaCountry } from '@/constants/countryCurrencyMapping'
-import { useIdentityVerification } from '@/hooks/useIdentityVerification'
+import { isBridgeSupportedCountry, getRegionIntent } from '@/utils/regions.utils'
 import { PointsAction } from '@/services/services.types'
 import { usePointsCalculation } from '@/hooks/usePointsCalculation'
-import { parseUnits } from 'viem'
 import posthog from 'posthog-js'
 import { ANALYTICS_EVENTS } from '@/constants/analytics.consts'
 import { withdrawCountryUrl } from '@/utils/native-routes'
 import { useSafeBack } from '@/hooks/useSafeBack'
 
 type View = 'INITIAL' | 'SUCCESS'
+
+// Copy shown when the on-chain deposit to the Bridge address succeeded but the
+// subsequent `/bridge/transfers/:id/confirm` call failed (most often a
+// fetchWithSentry timeout). The Bridge transfer row exists on the BE; the
+// poller / Bridge webhook will eventually complete it. We MUST NOT show a
+// Retry button in this state — retrying re-runs sendMoney() and would send
+// funds to the deposit address a second time (Sentry PEANUT-UI-QH9, 2026-06-01).
+const CONFIRM_PENDING_COPY =
+    'Your transfer is processing. Funds were sent on-chain successfully — this can take a few minutes to confirm. If you don’t see the withdrawal in your activity within 30 minutes, please contact support.'
 
 export default function WithdrawBankPage() {
     const {
@@ -63,20 +71,65 @@ export default function WithdrawBankPage() {
     } = useWithdrawFlow()
     const { user, fetchUser } = useAuth()
     const { address, sendMoney, spendableBalance: balance } = useWallet()
-    const { guardWithTos, showBridgeTos, hideTos } = useBridgeTosGuard()
+    const { guardWithTos, showBridgeTos, hideTos } = useTosGuard()
     const queryClient = useQueryClient()
     const router = useRouter()
     const searchParams = useSearchParams()
     const [isLoading, setIsLoading] = useState(false)
     const [view, setView] = useState<View>('INITIAL')
+    // Set as soon as the on-chain wallet→Bridge tx confirms. If a subsequent
+    // confirmOfframp() call fails, this gates the UI into a "processing" state
+    // instead of showing a Retry button that would re-fire sendMoney().
+    const [submittedTxHash, setSubmittedTxHash] = useState<string | null>(null)
     const params = useParams()
     // read country from path params (web) or query params (native/capacitor)
     const country = (params.country as string) || searchParams.get('country') || ''
     const [balanceErrorMessage, setBalanceErrorMessage] = useState<string | null>(null)
     const { hasPendingTransactions } = usePendingTransactions()
-    const { isBridgeSupportedCountry } = useIdentityVerification()
-    const { gate } = useBridgeTransferReadiness()
-    const sumsubFlow = useMultiPhaseKycFlow({})
+    // Country-scoped bank-channel withdraw gate. Same rationale as the
+    // add-money/[country]/bank page: scope to the rail jurisdiction this page
+    // actually withdraws to (PT/DE/… → EU SEPA; US → ACH; etc.) so a stuck
+    // PENDING rail in an unrelated jurisdiction can't block this page.
+    const { gateFor } = useCapabilities()
+    const bankCountry = useMemo(() => railJurisdictionForBank(getCountryFromPath(country)?.id), [country])
+    const gate = useMemo(() => gateFor('withdraw', { channel: 'bank', country: bankCountry }), [gateFor, bankCountry])
+    // bridge re-verification ("we're reviewing your details") modal for the
+    // waiting-on-provider gate — keeps the status poll alive + auto-dismisses.
+    const pendingModal = useWaitingOnProviderModal(gate)
+    // EEA-uplift funnel events (PostHog): started on launch, completed on KYC
+    // success. trackCompleted no-ops unless an uplift was started this session.
+    const {
+        trackStarted: trackUpliftStarted,
+        trackCompleted: trackUpliftCompleted,
+        reset: resetUpliftFunnel,
+    } = useEeaUpliftFunnel('withdraw')
+
+    const sumsubFlow = useMultiPhaseKycFlow({
+        // Fire completed at Sumsub approval (verification submitted), not at
+        // end-of-flow — so it isn't lost if the user drops during the
+        // post-approval ToS / preparing steps.
+        onKycApproved: () => trackUpliftCompleted(),
+        // Abandoned attempt: clear the pending start so a later unrelated KYC
+        // success on this page can't mis-fire eea_uplift_completed.
+        onManualClose: resetUpliftFunnel,
+    })
+    // A ready bank rail can still carry a pending Bridge requirement (the gate's
+    // `advisory`). Enforce it as a mandatory, non-skippable pre-empt before the
+    // withdrawal — the offramp cannot proceed until it's completed.
+    const advisory = gate.kind === 'ready' ? gate.advisory : undefined
+    const { intercept: advisoryIntercept, modalProps: advisoryModalProps } = useAdvisoryPreempt({
+        advisory,
+        isLoading: sumsubFlow.isLoading,
+        // Route through the self-heal resubmit path (reheal-tagged action) so the
+        // completed submission round-trips to Bridge. start-action mints a plain
+        // token whose webhook completion has no Bridge relay → answers are dropped.
+        // note: eea_uplift_started is fired at modal-open (the handlers below),
+        // not here, so abandoners are captured too.
+        onCompleteNow: () => {
+            if (!advisory) return Promise.resolve()
+            return sumsubFlow.handleSelfHealResubmit('BRIDGE', advisory.requirementKey)
+        },
+    })
     const [showKycModal, setShowKycModal] = useState(false)
     const { setIsSupportModalOpen } = useModalsContext()
 
@@ -131,32 +184,17 @@ export default function WithdrawBankPage() {
     }, [bankAccount, router, amountToWithdraw, country, view])
 
     const destinationDetails = (account: Account) => {
-        let countryId: string
-
-        switch (account.type) {
-            case AccountType.US:
-                countryId = 'US'
-                break
-            case AccountType.IBAN:
-                // Default to a European country that uses EUR/SEPA
-                countryId = 'DE' // Germany as default EU country
-                break
-            case AccountType.CLABE:
-                countryId = 'MX'
-                break
-            case AccountType.GB:
-                countryId = 'GB'
-                break
-            default:
-                return {
-                    currency: '',
-                    paymentRail: '',
-                    externalAccountId: null,
-                }
-        }
-
-        const { currency, paymentRail } = getOfframpCurrencyConfig(countryId)
-
+        // Derive currency + rail from the account's actual type (GB→GBP, IBAN→EUR,
+        // US→USD, CLABE→MXN) rather than re-deriving from a country switch whose
+        // `default` returned an empty currency/rail. A UK account that arrived typed
+        // anything but GB (the pre-BANK_GB BE mistype, or a Prisma-shaped 'BANK_GB'
+        // string) fell through that default → empty payload → "External account ID
+        // is missing.". getOfframpConfigFromAccount tolerates both the projected
+        // ('gb') and Prisma-shaped ('BANK_GB') strings and keeps this flow
+        // consistent with the Claim flow (BankFlowManager). Manteca accounts never
+        // reach this Bridge page (separate /withdraw/manteca route), so its throw
+        // cannot fire here.
+        const { currency, paymentRail } = getOfframpConfigFromAccount(account)
         return {
             currency,
             paymentRail,
@@ -178,11 +216,25 @@ export default function WithdrawBankPage() {
         return 'N/A'
     }
 
-    const handleCreateAndInitiateOfframp = async () => {
-        if (gate.type !== 'ready') {
-            if (gate.type === 'accept_tos') {
+    const proceedWithOfframp = async () => {
+        if (gate.kind !== 'ready') {
+            // capabilities still loading — silently no-op.
+            if (gate.kind === 'loading') return
+            // `waiting-on-provider` means bridge is re-reviewing submitted info
+            // (e.g. right after an eea uplift) — show the pending modal instead of
+            // a dead button, and re-arm the capability poller so we pick up
+            // bridge's latest status live and the modal auto-dismisses on clear.
+            if (gate.kind === 'waiting-on-provider') {
+                pendingModal.open()
+                return
+            }
+            if (gate.kind === 'accept-tos') {
                 guardWithTos()
             } else {
+                // urgent (post-cliff) eea uplift lands here as a fixable-rejection —
+                // fire the funnel event as this KYC modal opens.
+                const upliftTrigger = upliftTriggerFromGate(gate)
+                if (upliftTrigger) trackUpliftStarted(upliftTrigger)
                 setShowKycModal(true)
             }
             return
@@ -262,15 +314,22 @@ export default function WithdrawBankPage() {
             // chain tx hash, and the BE rejects it.
             const txIdentifier = receipt?.transactionHash ?? txHash ?? userOpHash
             if (!txIdentifier) throw new Error('No transaction identifier returned from sendMoney')
+
+            // Mark the on-chain leg done BEFORE confirmOfframp. From this point on
+            // any error path (including a confirm timeout) must NOT offer Retry —
+            // re-running this handler would call sendMoney() again and double-pay.
+            setSubmittedTxHash(txIdentifier)
+
             const confirmResult = await confirmOfframp(data.transferId, txIdentifier)
 
             if (confirmResult.error) {
-                // This is a tricky state. The on-chain tx succeeded, but the backend failed to record it.
-                // For now, we'll show a detailed error. A more robust solution could involve a retry mechanism
-                // or flagging this for support.
+                // On-chain tx succeeded, backend confirm failed. Bridge will still
+                // process the deposit (the funds are at the deposit address and the
+                // BE has the transfer row). Show a processing state, NOT an error
+                // with a Retry button — see CONFIRM_PENDING_COPY + the gate below.
                 setError({
                     showError: true,
-                    errorMessage: `Your funds were sent, but there was an issue confirming the transfer. Please contact support.`,
+                    errorMessage: CONFIRM_PENDING_COPY,
                 })
                 throw new Error(confirmResult.error)
             }
@@ -302,6 +361,17 @@ export default function WithdrawBankPage() {
         }
     }
 
+    // Enforce the mandatory verification pre-empt, then run the offramp. When the
+    // gate isn't `ready` (or there's no pending requirement) this is a no-op and
+    // proceedWithOfframp runs straight away (it handles the not-ready cases).
+    // upcoming (future-dated) eea uplift opens the advisory modal here — fire the
+    // funnel event as it opens.
+    const handleCreateAndInitiateOfframp = () => {
+        const advisoryTrigger = upliftTriggerFromAdvisory(advisory)
+        if (advisoryTrigger) trackUpliftStarted(advisoryTrigger)
+        advisoryIntercept(() => void proceedWithOfframp())
+    }
+
     const countryCodeForFlag = () => {
         if (!bankAccount?.details?.countryCode) return ''
         const code =
@@ -326,12 +396,9 @@ export default function WithdrawBankPage() {
             return
         }
 
-        const withdrawAmount = parseUnits(amountToWithdraw, PEANUT_WALLET_TOKEN_DECIMALS)
-        if (withdrawAmount > balance) {
-            setBalanceErrorMessage('Not enough balance to complete withdrawal.')
-        } else {
-            setBalanceErrorMessage(null)
-        }
+        // gate on the displayed total; an in-transit shortfall passes here and
+        // fails late with the settling message at execution.
+        setBalanceErrorMessage(isAmountWithinBalance(amountToWithdraw, balance) ? null : INSUFFICIENT_BALANCE_MESSAGE)
     }, [amountToWithdraw, balance, hasPendingTransactions, isLoading])
 
     if (!bankAccount) {
@@ -420,7 +487,23 @@ export default function WithdrawBankPage() {
                         <PaymentInfoRow hideBottomBorder label="Fee" value={`$ 0.00`} />
                     </Card>
 
-                    {error.showError ? (
+                    {submittedTxHash ? (
+                        // On-chain leg already fired. Even if confirmOfframp failed
+                        // we must NOT offer Retry — it would re-run sendMoney() and
+                        // double-pay (Sentry PEANUT-UI-QH9). Surface the in-progress
+                        // state and a Done button that takes the user home.
+                        <Button
+                            shadowSize="4"
+                            className="w-full"
+                            onClick={() => {
+                                router.push('/home')
+                                setAmountToWithdraw('')
+                                setSelectedMethod(null)
+                            }}
+                        >
+                            Done
+                        </Button>
+                    ) : error.showError ? (
                         <Button
                             disabled={isLoading}
                             onClick={handleCreateAndInitiateOfframp}
@@ -445,7 +528,16 @@ export default function WithdrawBankPage() {
                             Withdraw
                         </Button>
                     )}
-                    {error.showError && <ErrorAlert description={error.errorMessage} />}
+                    {submittedTxHash ? (
+                        <InfoCard
+                            variant="info"
+                            icon="info"
+                            title="Transfer processing"
+                            description={CONFIRM_PENDING_COPY}
+                        />
+                    ) : (
+                        error.showError && <ErrorAlert description={error.errorMessage} />
+                    )}
                     {balanceErrorMessage && <ErrorAlert description={balanceErrorMessage} />}
                 </div>
             )}
@@ -470,31 +562,48 @@ export default function WithdrawBankPage() {
                     handleCreateAndInitiateOfframp()
                 }}
                 onSkip={hideTos}
+                reasonCode={gate.kind === 'accept-tos' ? gate.reason?.code : undefined}
             />
 
             <InitiateKycModal
                 visible={showKycModal}
-                onClose={() => setShowKycModal(false)}
+                onClose={() => {
+                    // dismiss = abandon: clear the uplift latch so a later
+                    // unrelated KYC success can't mis-fire eea_uplift_completed.
+                    setShowKycModal(false)
+                    resetUpliftFunnel()
+                }}
                 onVerify={async () => {
-                    if (gate.type === 'fixable_rejection') {
+                    if (gate.kind === 'restart-identity') {
+                        await sumsubFlow.handleRestartIdentity()
+                    } else if (gate.kind === 'fixable-rejection') {
                         await sumsubFlow.handleSelfHealResubmit('BRIDGE')
                     } else {
                         await sumsubFlow.handleInitiateKyc(
-                            'STANDARD',
+                            getRegionIntent(getCountryFromPath(country)?.region ?? 'rest-of-the-world'),
                             undefined,
-                            gate.type === 'needs_enrollment' || undefined
+                            gate.kind === 'needs-enrollment' || undefined,
+                            getCountryFromPath(country)?.id
                         )
                     }
                 }}
                 onContactSupport={() => {
                     setShowKycModal(false)
+                    resetUpliftFunnel()
                     setIsSupportModalOpen(true)
                 }}
                 isLoading={sumsubFlow.isLoading}
                 error={sumsubFlow.error}
-                variant={getKycModalVariant(gate.type)}
-                providerMessage={getGateProviderMessage(gate)}
+                variant={getKycModalVariant(gate.kind)}
+                providerMessage={getGateUserMessage(gate)}
                 regionName={getCountryFromPath(country)?.title}
+            />
+            <AdvisoryPreemptModal {...advisoryModalProps} />
+
+            <KycReverificationPendingModal
+                isOpen={pendingModal.isOpen}
+                onClose={pendingModal.close}
+                message={pendingModal.message}
             />
             <SumsubKycModals flow={sumsubFlow} />
         </div>

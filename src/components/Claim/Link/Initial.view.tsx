@@ -15,7 +15,7 @@ import { loadingStateContext, tokenSelectorContext } from '@/context'
 import { useAuth } from '@/context/authContext'
 import { useWallet } from '@/hooks/wallet/useWallet'
 import { sendLinksApi } from '@/services/sendLinks'
-import { areEvmAddressesEqual, formatTokenAmount } from '@/utils/general.utils'
+import { areEvmAddressesEqual, formatTokenAmount, toInviteCode } from '@/utils/general.utils'
 import { useRecipientDisplay } from '@/hooks/useRecipientDisplay'
 import { ErrorHandler } from '@/utils/friendly-error.utils'
 import { fetchWithSentry } from '@/utils/sentry.utils'
@@ -42,9 +42,9 @@ import { evmChainIdToRhinoName } from '@/constants/rhino.consts'
 import { getTokenSymbol } from '@/utils/general.utils'
 import { Button } from '@/components/0_Bruddle/Button'
 import Image from 'next/image'
-import { PEANUT_LOGO_BLACK, PEANUTMAN_LOGO } from '@/assets'
+import { PEANUT_LOGO_BLACK, PEANUTMAN } from '@/assets'
 import { GuestVerificationModal } from '@/components/Global/GuestVerificationModal'
-import useKycStatus from '@/hooks/useKycStatus'
+import { useCapabilities } from '@/hooks/useCapabilities'
 import MantecaFlowManager from './MantecaFlowManager'
 import ErrorAlert from '@/components/Global/ErrorAlert'
 import { invitesApi } from '@/services/invites'
@@ -103,6 +103,7 @@ export const InitialClaimLinkView = (props: IClaimScreenProps) => {
         resetFlow: resetClaimBankFlow,
         claimToMercadoPago,
         setClaimToMercadoPago,
+        setRegionalMethodType,
         hideTokenSelector,
         setHideTokenSelector,
     } = useClaimBankFlow()
@@ -130,7 +131,12 @@ export const InitialClaimLinkView = (props: IClaimScreenProps) => {
     const searchParams = useSearchParams()
     const prevRecipientType = useRef<string | null>(null)
     const prevUser = useRef(user)
-    const { isUserBridgeKycApproved } = useKycStatus()
+    // Bank-claim routing checks "is there an enabled bank rail the claim could
+    // settle through?". Provider-blind — Manteca PIX_BR counts as a bank rail
+    // too, but a card-only user (Rain) is correctly excluded.
+    const hasEnabledBankRail = useCapabilities()
+        .bankRails()
+        .some((rail) => rail.status === 'enabled')
 
     const [isDevconnectClaimFlow, setisDevconnectClaimFlow] = useState(false)
 
@@ -263,7 +269,7 @@ export const InitialClaimLinkView = (props: IClaimScreenProps) => {
                         setLoadingState('Idle')
                         return
                     }
-                    const inviteCode = `${inviterUsername}INVITESYOU`
+                    const inviteCode = toInviteCode(inviterUsername)
                     const result = await invitesApi.acceptInvite(
                         inviteCode,
                         EInviteType.PAYMENT_LINK,
@@ -526,7 +532,7 @@ export const InitialClaimLinkView = (props: IClaimScreenProps) => {
                     recipient: recipient.name ?? recipient.address,
                     password: '',
                 })
-                if (isUserBridgeKycApproved) {
+                if (hasEnabledBankRail) {
                     const account = user.accounts.find(
                         (account) =>
                             account.identifier.replaceAll(/\s/g, '').toLowerCase() ===
@@ -816,7 +822,7 @@ export const InitialClaimLinkView = (props: IClaimScreenProps) => {
                 <div className="flex items-center gap-1">
                     <div>Receive on </div>
                     <div className="flex items-center gap-1">
-                        <Image src={PEANUTMAN_LOGO} alt="Peanut Logo" className="size-5" />
+                        <Image src={PEANUTMAN} alt="Peanut Logo" className="size-5" />
                         <Image src={PEANUT_LOGO_BLACK} alt="Peanut Logo" />
                     </div>
                 </div>
@@ -869,6 +875,14 @@ export const InitialClaimLinkView = (props: IClaimScreenProps) => {
             if (stepFromURL === 'claim' && isPeanutWallet) {
                 handleClaimLink(false, true)
             } else if (stepFromURL === 'regional-claim') {
+                // restore the method the user tapped BEFORE the auth redirect —
+                // context state didn't survive the remount, only the URL did.
+                // without a valid param the method stays null (unknown), never
+                // a default that could masquerade as a real choice.
+                const methodFromURL = searchParams.get('method')
+                if (methodFromURL === 'pix' || methodFromURL === 'mercadopago') {
+                    setRegionalMethodType(methodFromURL)
+                }
                 setClaimToMercadoPago(true)
             }
         }

@@ -1,6 +1,7 @@
 import * as Sentry from '@sentry/nextjs'
 
 import { type JSONValue } from '../interfaces/interfaces'
+import { reportNetworkError, reportNetworkOk } from './connectivity'
 
 /**
  * Endpoint + status combinations to skip reporting.
@@ -12,12 +13,258 @@ const SKIP_REPORTING: Array<{ pattern: string | RegExp; statuses: number[] }> = 
     { pattern: /\/get-user(?:\b|$)/, statuses: [400, 401, 403, 404] },
     { pattern: /users/, statuses: [400, 401, 403, 404] },
     { pattern: /perks/, statuses: [400, 401, 403, 404] },
-    { pattern: /qr-payment\/init/, statuses: [400] },
+    // /invites/validate 400 = "Invalid Invite": the user mistyped an invite code.
+    // Expected input validation, surfaced inline to the user — not a server bug.
+    { pattern: /\/invites\/validate/, statuses: [400] },
+    // qr-payment/init: 400 = open QR awaiting merchant amount; 422 = a QR the
+    // provider can't decode (bad/expired/unsupported) — both are user-input
+    // outcomes shown to the user, not server bugs. (BE peanut-api-ts #1041.)
+    { pattern: /qr-payment\/init/, statuses: [400, 422] },
     // Rain card secrets endpoints are intentionally rate-limited (5/min) — a
     // 429 here is an expected outcome surfaced to the user, not a server bug.
     { pattern: /\/rain\/cards\/[^/]+\/details/, statuses: [429] },
     { pattern: /\/rain\/cards\/[^/]+\/pin/, statuses: [429] },
+    // /withdraw/prepare 425 is Rain's withdrawal-signature cooldown — surfaced
+    // to the user via the cooldown modal + floating timer. Normal UX state,
+    // not an error; would otherwise flood Sentry on every retry.
+    { pattern: /\/rain\/cards\/withdraw\/prepare/, statuses: [425] },
 ]
+
+/**
+ * URLs whose request OR response body carries sensitive data wholesale.
+ * For these, the body is replaced with '[REDACTED]' before being attached
+ * to Sentry — covers card secrets, KYC submissions, send-link passwords,
+ * auth credentials.
+ */
+const BODY_SENSITIVE_URLS: RegExp[] = [
+    // Card secrets — PIN, CVV, details
+    /\/rain\/cards\/[^/]+\/(?:pin|cvv|details)(?:[/?]|$)/,
+    // Card creation/update — Rain backend, holder PII
+    /\/rain\/cards(?:\?|$)/,
+    /\/rain\/cardholders/,
+    // Send-link passwords
+    /\/send-link\/(?:create|verify-password|claim|set-password)/,
+    /\/verify-password/,
+    // Auth — login, signup, password set/reset
+    /\/(?:login|signup|register|set-password|reset-password|change-password)/,
+    // KYC — Bridge, Sumsub, Manteca
+    /\/kyc\/(?:start|submit|update)/,
+    /\/bridge\/customers/,
+    /\/manteca\/(?:user|widgets)/,
+    /\/sumsub\/(?:applicant|token)/,
+]
+
+/**
+ * Lowercased + underscore/hyphen-stripped field names whose values should
+ * be redacted recursively. Identity fields (userId, username, email,
+ * inviteCode) are intentionally NOT in this set — they're already in
+ * PostHog and Hugo wants them queryable in Sentry too.
+ *
+ * IMPORTANT: this is an EXACT-MATCH set. We deliberately do NOT
+ * substring-match because Peanut has first-class onchain addresses
+ * everywhere — `walletAddress`, `recipientAddress`, `tokenAddress`,
+ * `sdaAddress`, `depositAddress`, `destinationAddress`, `payerAddress`.
+ * Those are public chain data that MUST stay visible for debugging
+ * onchain flows. Substring-matching on `address` would clobber every
+ * one of them. Same for `pin`, `token`, `seed` — share names with
+ * non-sensitive concepts.
+ */
+const SENSITIVE_KEYS = new Set([
+    // Passwords + secrets
+    'password',
+    'pwd',
+    'passphrase',
+    'secret',
+    'secretkey',
+    'apikey',
+    'apitoken',
+    'bearer',
+    'authtoken',
+    'jwt',
+    'token',
+    'sessiontoken',
+    'refreshtoken',
+    'accesstoken',
+    'idtoken',
+    'privatekey',
+    'mnemonic',
+    'seed',
+    'seedphrase',
+    'recoveryphrase',
+    // Card data
+    'pan',
+    'cardnumber',
+    'cvv',
+    'cvc',
+    'securitycode',
+    'cardpin',
+    'pin',
+    'cardholdername',
+    'expirydate',
+    'expirymonth',
+    'expiryyear',
+    'expmonth',
+    'expyear',
+    // Government IDs (English + Bridge long-form)
+    'ssn',
+    'socialsecurity',
+    'socialsecuritynumber',
+    'taxid',
+    'taxidentificationnumber',
+    'tin',
+    'dni',
+    'cuit',
+    'cuil',
+    'rfc',
+    'curp',
+    'nif',
+    'governmentid',
+    'governmentidnumber',
+    'documentnumber',
+    'passport',
+    'passportnumber',
+    'driverslicense',
+    'licensenumber',
+    'idnumber',
+    'nationalid',
+    'nationalidnumber',
+    // Manteca (Spanish)
+    'documento',
+    'numerodocumento',
+    'numerodedocumento',
+    // Bank account numbers
+    'iban',
+    'swift',
+    'bic',
+    'sortcode',
+    'routingnumber',
+    'accountnumber',
+    'bankaccountnumber',
+    'cbu',
+    'cvu',
+    'clabe',
+    // PII — names (English + Manteca Spanish)
+    'firstname',
+    'lastname',
+    'fullname',
+    'givenname',
+    'familyname',
+    'surname',
+    'middlename',
+    'mothername',
+    'mothersmaidenname',
+    'maidenname',
+    'customerfirstname',
+    'customerlastname',
+    'nombre',
+    'apellido',
+    // PII — address. NOTE: `address` alone is NOT here — onchain addresses
+    // (walletAddress, recipientAddress, etc.) must stay visible for
+    // debugging onchain flows.
+    'streetaddress',
+    'street1',
+    'street2',
+    'street3',
+    'streetline1',
+    'streetline2',
+    'streetline3',
+    'addressline1',
+    'addressline2',
+    'addressline3',
+    'billingaddress',
+    'homeaddress',
+    'mailingaddress',
+    'residentialaddress',
+    'permanentaddress',
+    'direccion',
+    'domicilio',
+    'postalcode',
+    'zipcode',
+    'zip',
+    'postcode',
+    // PII — DOB / contact
+    'dob',
+    'dateofbirth',
+    'birthdate',
+    'birthday',
+    'phonenumber',
+    'mobilenumber',
+    'telephone',
+    'telefono',
+    // 2FA / OTP
+    'otp',
+    'verificationcode',
+    'totpsecret',
+    'twofactor',
+    'twofactorsecret',
+])
+
+function normalizeKey(key: string): string {
+    return key.toLowerCase().replace(/[_-]/g, '')
+}
+
+function isSensitiveKey(key: string): boolean {
+    return SENSITIVE_KEYS.has(normalizeKey(key))
+}
+
+function isSensitiveUrl(url: string | undefined): boolean {
+    if (!url) return false
+    return BODY_SENSITIVE_URLS.some((pattern) => pattern.test(url))
+}
+
+/**
+ * Recursively redacts sensitive keys in any object — applied to both
+ * request bodies AND response bodies before they ship to Sentry.
+ */
+export function scrubObject(value: unknown, depth = 0): unknown {
+    if (depth > 10) return '[REDACTED: max depth]'
+    if (value === null || value === undefined) return value
+    if (typeof value !== 'object') return value
+    if (Array.isArray(value)) return value.map((item) => scrubObject(item, depth + 1))
+    // Prototype-pollution defense — two layers, both required:
+    //   1. `Object.create(null)` so `out` has no prototype to pollute.
+    //   2. `Object.defineProperty` with explicit descriptor instead of
+    //      `out[key] = …`. The former is recognised by CodeQL's taint
+    //      analysis as a sanitizer; the latter triggers
+    //      js/prototype-polluting-assignment even when keys are validated
+    //      because CodeQL can't prove the runtime check is complete.
+    //   3. Explicit skip of __proto__ / constructor / prototype — belt
+    //      and braces; redundant with (1) but documents intent.
+    const out: Record<string, unknown> = Object.create(null)
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+        if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue
+        Object.defineProperty(out, key, {
+            value: isSensitiveKey(key) ? '[REDACTED]' : scrubObject(val, depth + 1),
+            writable: true,
+            enumerable: true,
+            configurable: true,
+        })
+    }
+    return out
+}
+
+export const sanitizeRequestBody = (url: string, body: BodyInit | null | undefined): BodyInit | string | null => {
+    if (body == null) return null
+    if (isSensitiveUrl(url)) return '[REDACTED: sensitive endpoint]'
+    // String bodies — try JSON parse, scrub, re-stringify; otherwise pass through.
+    if (typeof body === 'string') {
+        try {
+            return JSON.stringify(scrubObject(JSON.parse(body)))
+        } catch {
+            return body
+        }
+    }
+    return body
+}
+
+/**
+ * Sanitize response bodies before they land in Sentry `extra`. Same
+ * URL + key-scrubbing as request bodies.
+ */
+export const sanitizeResponseBody = (url: string, body: unknown): unknown => {
+    if (isSensitiveUrl(url)) return '[REDACTED: sensitive endpoint]'
+    return scrubObject(body)
+}
 
 /**
  * Map URL → feature tag so Sentry issues can be filtered by product surface
@@ -66,7 +313,19 @@ const sanitizeHeaders = (headers: any): any => {
     if (!headers) return headers
 
     const sanitized = { ...headers }
-    const sensitiveHeaders = ['authorization', 'cookie', 'x-auth-token', 'api-key']
+    const sensitiveHeaders = [
+        'authorization',
+        'cookie',
+        'set-cookie',
+        'x-auth-token',
+        'api-key',
+        'x-api-key',
+        'apikey',
+        'md-api-key', // Manteca
+        'x-app-token', // Sumsub
+        'x-app-access-sig',
+        'x-app-access-ts',
+    ]
 
     for (const key of Object.keys(sanitized)) {
         if (sensitiveHeaders.includes(key.toLowerCase())) {
@@ -105,6 +364,8 @@ export const fetchWithSentry = async (
         })
 
         clearTimeout(timeoutId)
+        // A response came back — the backend is reachable, clear any failure streak.
+        reportNetworkOk()
 
         if (!response.ok) {
             // Skip both the console warn AND Sentry submission for expected
@@ -133,9 +394,9 @@ export const fetchWithSentry = async (
                             url,
                             method,
                             requestHeaders: sanitizeHeaders(options.headers || {}),
-                            requestBody: options.body || null,
+                            requestBody: sanitizeRequestBody(url, options.body),
                             status: response.status,
-                            response: errorContent,
+                            response: sanitizeResponseBody(url, errorContent),
                         },
                     })
                 })
@@ -145,6 +406,9 @@ export const fetchWithSentry = async (
         return response
     } catch (error: unknown) {
         clearTimeout(timeoutId)
+        // fetch rejected (timeout / DNS / connection refused) — the request never
+        // reached the backend, so flag a connectivity failure.
+        reportNetworkError()
         console.error(error)
 
         if (error instanceof Error && error.name === 'AbortError') {
@@ -162,7 +426,7 @@ export const fetchWithSentry = async (
                         method: options.method || 'GET',
                         timeoutMs,
                         requestHeaders: sanitizeHeaders(options.headers || {}),
-                        requestBody: options.body || null,
+                        requestBody: sanitizeRequestBody(url, options.body),
                     },
                 })
             })
@@ -197,7 +461,7 @@ export const fetchWithSentry = async (
                     url,
                     method: options.method || 'GET',
                     requestHeaders: sanitizeHeaders(options.headers || {}),
-                    requestBody: options.body || null,
+                    requestBody: sanitizeRequestBody(url, options.body),
                     errorMessage,
                     errorName,
                     errorStack,

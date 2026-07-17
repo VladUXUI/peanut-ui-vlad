@@ -1,6 +1,6 @@
 import { type IconName } from '@/components/Global/Icons/Icon'
 import AvatarWithBadge, { type AvatarSize } from '@/components/Profile/AvatarWithBadge'
-import { type TransactionType } from '@/components/TransactionDetails/TransactionCard'
+import { type TransactionType } from '@/components/TransactionDetails/transaction-types'
 import {
     AVATAR_LINK_BG,
     AVATAR_TEXT_DARK,
@@ -11,7 +11,6 @@ import {
 import { getFlagUrl } from '@/constants/countryCurrencyMapping'
 import React from 'react'
 import { isAddress } from 'viem'
-import { type StatusPillType } from '../Global/StatusPill'
 
 interface TransactionAvatarBadgeProps {
     size?: AvatarSize
@@ -95,9 +94,11 @@ const TransactionAvatarBadge: React.FC<TransactionAvatarBadgeProps> = ({
             // textColor = context === 'card' ? AVATAR_TEXT_LIGHT : AVATAR_TEXT_DARK
             break
         case 'card_pay':
-            // Rain card spend without a Rain-enriched merchant logo
-            // (TransactionDetailsHeaderCard prefers `avatarUrl` when set,
-            // so a real merchant brand mark wins over this fallback).
+        case 'refund':
+            // Rain card spend / card refund without a Rain-enriched merchant
+            // logo (TransactionDetailsHeaderCard prefers `avatarUrl` when set,
+            // so a real merchant brand mark wins over this fallback). A refund
+            // shares the card-spend treatment — same merchant, same card.
             displayIconName = 'credit-card'
             displayInitials = undefined
             break

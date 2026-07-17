@@ -7,6 +7,7 @@ import InstallPWA from '@/components/Setup/Views/InstallPWA'
 import { useBravePWAInstallState } from '@/hooks/useBravePWAInstallState'
 import { DeviceType } from '@/hooks/useGetDeviceType'
 import classNames from 'classnames'
+import { motion, useReducedMotion } from 'framer-motion'
 import Image from 'next/image'
 import { Children, type ReactNode, cloneElement, memo, type ReactElement, useState } from 'react'
 import { twMerge } from 'tailwind-merge'
@@ -41,7 +42,9 @@ interface SetupWrapperProps {
 
 // define responsive height classes for different layout types
 const IMAGE_CONTAINER_CLASSES: Record<LayoutType, string> = {
-    signup: 'min-h-[55dvh] md:min-h-full', // signup view has larger container height
+    // signup: flexible hero — grows into leftover space but never squeezes the
+    // content panel into scrolling on short screens (e.g. iPhone X)
+    signup: 'min-h-[35dvh] grow md:grow-0 md:min-h-full',
     standard: 'min-h-[50dvh] md:min-h-full', // rest all views has medium container height
     'android-initial-pwa-install': 'min-h-[60dvh] md:min-h-full',
 }
@@ -59,53 +62,51 @@ const STAR_POSITIONS = [
  * navigation component for back, skip, and logout buttons
  * rendered at the top of the layout when any button is enabled
  */
-const Navigation = memo(
-    ({
-        showBackButton,
-        showSkipButton,
-        showLogoutButton,
-        onBack,
-        onSkip,
-        onLogout,
-        isLoggingOut,
-    }: Pick<
-        SetupWrapperProps,
-        'showBackButton' | 'showSkipButton' | 'showLogoutButton' | 'onBack' | 'onSkip' | 'onLogout' | 'isLoggingOut'
-    >) => {
-        if (!showBackButton && !showSkipButton && !showLogoutButton) return null
+const Navigation = memo(function Navigation({
+    showBackButton,
+    showSkipButton,
+    showLogoutButton,
+    onBack,
+    onSkip,
+    onLogout,
+    isLoggingOut,
+}: Pick<
+    SetupWrapperProps,
+    'showBackButton' | 'showSkipButton' | 'showLogoutButton' | 'onBack' | 'onSkip' | 'onLogout' | 'isLoggingOut'
+>) {
+    if (!showBackButton && !showSkipButton && !showLogoutButton) return null
 
-        return (
-            <div className="absolute top-8 z-20 flex w-full items-center justify-between px-6">
-                <div>
-                    {showBackButton && (
-                        <Button variant="stroke" onClick={onBack} className="h-8 w-8 p-0" aria-label="Go back">
-                            <Icon name="chevron-up" fill="black" size={20} className="-rotate-90" />
-                        </Button>
-                    )}
-                </div>
-                <div className="flex items-center gap-3">
-                    {showSkipButton && (
-                        <Button onClick={onSkip} variant="transparent-dark" className="h-auto w-fit p-0">
-                            <span className="text-grey-1">Skip</span>
-                        </Button>
-                    )}
-                    {showLogoutButton && (
-                        <Button
-                            onClick={onLogout}
-                            loading={isLoggingOut}
-                            variant="stroke"
-                            className={twMerge('h-7 w-7 p-0', isLoggingOut && 'pl-3')}
-                            aria-label="Logout"
-                            disabled={isLoggingOut}
-                        >
-                            <Icon name="logout" fill="black" size={24} />
-                        </Button>
-                    )}
-                </div>
+    return (
+        <div className="absolute top-8 z-20 flex w-full items-center justify-between px-6">
+            <div>
+                {showBackButton && (
+                    <Button variant="stroke" onClick={onBack} className="h-8 w-8 p-0" aria-label="Go back">
+                        <Icon name="chevron-up" fill="black" size={20} className="-rotate-90" />
+                    </Button>
+                )}
             </div>
-        )
-    }
-)
+            <div className="flex items-center gap-3">
+                {showSkipButton && (
+                    <Button onClick={onSkip} variant="transparent-dark" className="h-auto w-fit p-0">
+                        <span className="text-grey-1">Skip</span>
+                    </Button>
+                )}
+                {showLogoutButton && (
+                    <Button
+                        onClick={onLogout}
+                        loading={isLoggingOut}
+                        variant="stroke"
+                        className={twMerge('h-7 w-7 p-0', isLoggingOut && 'pl-3')}
+                        aria-label="Logout"
+                        disabled={isLoggingOut}
+                    >
+                        <Icon name="logout" fill="black" size={24} />
+                    </Button>
+                )}
+            </div>
+        </div>
+    )
+})
 
 /**
  * ImageSection component handles the illustrations and animations
@@ -123,7 +124,7 @@ const ImageSection = ({
     const containerClass = IMAGE_CONTAINER_CLASSES[layoutType]
     const imageClass = !!imageClassName
         ? imageClassName
-        : 'w-full max-w-[80%] md:max-w-[75%] lg:max-w-xl object-contain relative'
+        : 'w-full max-w-[80%] max-h-[85%] md:max-w-[75%] lg:max-w-xl object-contain relative'
 
     // special rendering for welcome/signup screens with animated decorations
     if (isSignup) {
@@ -187,113 +188,120 @@ const ImageSection = ({
  * provides a responsive layout structure for setup/onboarding screens
  * uses dynamic viewport height (dvh) for better mobile browser compatibility
  */
-export const SetupWrapper = memo(
-    ({
-        layoutType,
-        children,
-        image,
-        title,
-        description,
-        contentClassName,
-        showBackButton,
-        showSkipButton,
-        showLogoutButton,
-        onBack,
-        onSkip,
-        onLogout,
-        isLoggingOut,
-        screenId,
-        imageClassName,
-        deferredPrompt,
-        canInstall,
-        deviceType,
-        titleClassName,
-    }: SetupWrapperProps) => {
-        const { isBrave } = useBravePWAInstallState()
-        const [showBraveSuccessMessage, setShowBraveSuccessMessage] = useState(false)
+export const SetupWrapper = memo(function SetupWrapper({
+    layoutType,
+    children,
+    image,
+    title,
+    description,
+    contentClassName,
+    showBackButton,
+    showSkipButton,
+    showLogoutButton,
+    onBack,
+    onSkip,
+    onLogout,
+    isLoggingOut,
+    screenId,
+    imageClassName,
+    deferredPrompt,
+    canInstall,
+    deviceType,
+    titleClassName,
+}: SetupWrapperProps) {
+    const { isBrave } = useBravePWAInstallState()
+    const [showBraveSuccessMessage, setShowBraveSuccessMessage] = useState(false)
+    const prefersReducedMotion = useReducedMotion()
 
-        const shouldShowBraveInstalledHeaderOnly =
-            (screenId === 'pwa-install' || screenId === 'android-initial-pwa-install') &&
-            isBrave &&
-            showBraveSuccessMessage
+    // Slide the white panel up on first paint for a native bottom-sheet feel.
+    // Mobile + landing only; read synchronously so the offset is correct on mount.
+    const [slideUpPanel] = useState(
+        () => screenId === 'landing' && typeof window !== 'undefined' && window.matchMedia('(max-width: 767px)').matches
+    )
+    const animatePanelIn = slideUpPanel && !prefersReducedMotion
 
-        const headingTitle = shouldShowBraveInstalledHeaderOnly ? 'Success!' : title
-        const headingDescription = shouldShowBraveInstalledHeaderOnly
-            ? 'Please open the Peanut app from your home screen to continue setup.'
-            : description
+    const shouldShowBraveInstalledHeaderOnly =
+        (screenId === 'pwa-install' || screenId === 'android-initial-pwa-install') && isBrave && showBraveSuccessMessage
 
-        return (
-            <div className="flex min-h-[100dvh] flex-col">
-                {/* navigation buttons */}
-                <Navigation
-                    showBackButton={showBackButton}
-                    showSkipButton={
-                        showSkipButton || (screenId === 'pwa-install' && (!canInstall || deviceType === DeviceType.WEB))
-                    }
-                    showLogoutButton={showLogoutButton}
-                    onBack={onBack}
-                    onSkip={onSkip}
-                    onLogout={onLogout}
-                    isLoggingOut={isLoggingOut}
+    const headingTitle = shouldShowBraveInstalledHeaderOnly ? 'Success!' : title
+    const headingDescription = shouldShowBraveInstalledHeaderOnly
+        ? 'Please open the Peanut app from your home screen to continue setup.'
+        : description
+
+    return (
+        <div className="flex min-h-[calc(100dvh_-_env(safe-area-inset-top)_-_env(safe-area-inset-bottom))] flex-col overflow-hidden">
+            {/* navigation buttons */}
+            <Navigation
+                showBackButton={showBackButton}
+                showSkipButton={
+                    showSkipButton || (screenId === 'pwa-install' && (!canInstall || deviceType === DeviceType.WEB))
+                }
+                showLogoutButton={showLogoutButton}
+                onBack={onBack}
+                onSkip={onSkip}
+                onLogout={onLogout}
+                isLoggingOut={isLoggingOut}
+            />
+
+            {/* content container */}
+            <div className="mx-auto flex w-full flex-grow flex-col md:flex-row">
+                {/* illustration section */}
+                <ImageSection
+                    imageClassName={imageClassName}
+                    screenId={screenId}
+                    layoutType={layoutType}
+                    image={image}
                 />
 
-                {/* content container */}
-                <div className="mx-auto flex w-full flex-grow flex-col md:flex-row">
-                    {/* illustration section */}
-                    <ImageSection
-                        imageClassName={imageClassName}
-                        screenId={screenId}
-                        layoutType={layoutType}
-                        image={image}
-                    />
-
-                    {/* content section */}
+                {/* content section */}
+                <motion.div
+                    initial={animatePanelIn ? { y: '100%' } : false}
+                    animate={animatePanelIn ? { y: 0 } : undefined}
+                    transition={{ type: 'spring', stiffness: 260, damping: 30 }}
+                    className={twMerge(
+                        'flex flex-col justify-between overflow-hidden bg-white px-6 pb-8 pt-6 md:h-[100dvh] md:justify-center md:space-y-4',
+                        // signup: panel hugs its content so the hero absorbs the slack
+                        // (paired with the grow classes in IMAGE_CONTAINER_CLASSES)
+                        layoutType === 'signup' ? 'grow-0 md:grow' : 'flex-grow',
+                        contentClassName
+                    )}
+                >
+                    {/* title and description container */}
                     <div
                         className={twMerge(
-                            'flex flex-grow flex-col justify-between overflow-hidden bg-white px-6 pb-8 pt-6 md:h-[100dvh] md:justify-center md:space-y-4',
-                            contentClassName
+                            'mx-auto h-full w-full space-y-4 md:max-h-48 md:max-w-xs',
+                            (screenId === 'signup' || screenId == 'join-beta') && 'md:max-h-12'
                         )}
                     >
-                        {/* todo: add transition animation */}
-                        {/* title and description container */}
-                        <div
-                            className={twMerge(
-                                'mx-auto h-full w-full space-y-4 md:max-h-48 md:max-w-xs',
-                                (screenId === 'signup' || screenId == 'join-beta') && 'md:max-h-12'
-                            )}
-                        >
-                            {headingTitle && (
-                                <h1
-                                    className={twMerge(
-                                        'w-full text-left text-xl font-extrabold leading-tight',
-                                        titleClassName
-                                    )}
-                                >
-                                    {headingTitle}
-                                </h1>
-                            )}
-                            {headingDescription && (
-                                <p className="text-base font-medium text-black">{headingDescription}</p>
-                            )}
-                        </div>
-                        {/* main content area */}
-                        <div className="mx-auto w-full md:max-w-xs">
-                            {Children.map(children, (child) => {
-                                if ((child as ReactElement).type === InstallPWA) {
-                                    return cloneElement(child as ReactElement, {
-                                        deferredPrompt,
-                                        canInstall,
-                                        deviceType,
-                                        screenId,
-                                        setShowBraveSuccessMessage,
-                                    })
-                                }
-                                return child
-                            })}
-                        </div>
+                        {headingTitle && (
+                            <h1
+                                className={twMerge(
+                                    'w-full text-left text-xl font-extrabold leading-tight',
+                                    titleClassName
+                                )}
+                            >
+                                {headingTitle}
+                            </h1>
+                        )}
+                        {headingDescription && <p className="text-base font-medium text-black">{headingDescription}</p>}
                     </div>
-                </div>
+                    {/* main content area */}
+                    <div className="mx-auto w-full md:max-w-xs">
+                        {Children.map(children, (child) => {
+                            if ((child as ReactElement).type === InstallPWA) {
+                                return cloneElement(child as ReactElement, {
+                                    deferredPrompt,
+                                    canInstall,
+                                    deviceType,
+                                    screenId,
+                                    setShowBraveSuccessMessage,
+                                })
+                            }
+                            return child
+                        })}
+                    </div>
+                </motion.div>
             </div>
-        )
-    }
-)
+        </div>
+    )
+})

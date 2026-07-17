@@ -1,16 +1,19 @@
+import { BALANCE_SETTLING_MESSAGE } from '@/utils/balance.utils'
+
 /** Safely extract a string-form of an unknown error + its `.message` if any.
  *  Lets the matchers below use `string` methods without unsafe property access
  *  while still accepting whatever shape callers throw (Error, string, object). */
-function extractErrorParts(error: unknown): { text: string; message: string | undefined } {
-    if (typeof error === 'string') return { text: error, message: error }
+function extractErrorParts(error: unknown): { text: string; message: string | undefined; name: string | undefined } {
+    if (typeof error === 'string') return { text: error, message: error, name: undefined }
     if (error && typeof error === 'object') {
-        const obj = error as { toString?: () => unknown; message?: unknown }
+        const obj = error as { toString?: () => unknown; message?: unknown; name?: unknown }
         const rawText = typeof obj.toString === 'function' ? obj.toString() : ''
         const text = typeof rawText === 'string' ? rawText : ''
         const message = typeof obj.message === 'string' ? obj.message : undefined
-        return { text, message }
+        const name = typeof obj.name === 'string' ? obj.name : undefined
+        return { text, message, name }
     }
-    return { text: '', message: undefined }
+    return { text: '', message: undefined, name: undefined }
 }
 
 /**
@@ -25,7 +28,12 @@ function extractErrorParts(error: unknown): { text: string; message: string | un
  * (signSpend / spend / sendMoney / sendTransactions(requiredUsdcAmount)).
  */
 export const rainCollateralErrorMessage = (error: unknown): string | null => {
-    const { text, message } = extractErrorParts(error)
+    const { text, message, name } = extractErrorParts(error)
+    // Stale card approval (409 STALE_CARD_APPROVAL) — the global re-enable modal
+    // owns the recovery CTA, but the flow that threw still shows an inline error.
+    // Surface the backend's friendly re-enable copy here so the inline path
+    // matches the modal instead of dead-ending on "contact support".
+    if (name === 'StaleCardApprovalError') return message ?? text
     if (
         text.includes('A previous withdrawal is still active for this card') ||
         text.includes('A previous withdrawal signature is still active') ||
@@ -39,12 +47,17 @@ export const rainCollateralErrorMessage = (error: unknown): string | null => {
 /** UI-friendly error message extractor. Matches substrings on common
  *  wallet / viem / Peanut API error messages and returns user-facing copy. */
 export const ErrorHandler = (error: unknown): string => {
-    const { text, message } = extractErrorParts(error)
+    const { text, message, name } = extractErrorParts(error)
     // Rain card-collateral errors — surface the backend's already user-
     // friendly copy verbatim (includes the "Try again in about M min." hint
     // on the cooldown case). Covers every spend path that touches Rain.
     const rainMsg = rainCollateralErrorMessage(error)
     if (rainMsg) return rainMsg
+    // Spend passed the displayed-balance gate but couldn't be routed yet
+    // (in-transit collateral not landed) — nudge a retry rather than "add funds".
+    // Match the typed error's name first (stable) and fall back to the message.
+    if (name === 'InsufficientSpendableError' || text.includes('Insufficient spendable balance'))
+        return BALANCE_SETTLING_MESSAGE
     if (text.includes('insufficient funds')) return "You don't have enough funds."
     if (text.includes('user rejected transaction')) return 'Please confirm the transaction in your wallet.'
     if (text.includes('not deployed on chain')) return 'Bulk is not able on this chain, please try another chain.'
@@ -88,10 +101,34 @@ export const ErrorHandler = (error: unknown): string => {
         return 'Failed to switch network. Try switching to the correct network manually.'
     if (text.includes('Insufficient balance')) return "You don't have enough balance."
     if (text.includes('The operation either timed out or was not allowed')) return 'Please confirm the transaction.'
+    // iOS Safari's NotAllowedError copy when the passkey ceremony never
+    // completes. Third-party credential providers (1Password) can wedge and
+    // refuse every assertion until unlocked or the device restarts
+    // (TASK-20000) — retrying after that works, so don't dead-end on the
+    // generic "contact support" fallback. Matched on message text rather
+    // than error.name: NotAllowedError is also thrown by camera/clipboard
+    // APIs (the QR scanner raises one), and wrapped signing errors keep the
+    // text but lose the name.
+    if (text.includes('not allowed by the user agent'))
+        return "Your device didn't complete the passkey confirmation. Try again — if it keeps failing, unlock your password manager (e.g. 1Password) or restart your device."
     if (text.includes('Wrong password or invalid transaction.') || text.includes('transaction may fail'))
         return 'Could not claim link, please refresh page. If problem persist confirm link with sender'
     if (text.includes('Send link already claimed')) return 'Send link already claimed'
     if (text.toLowerCase().includes('liquidity'))
         return message || 'Low liquidity. Please try a smaller amount or different route.'
+    // viem transport timeout — most often a slow ZeroDev paymaster/bundler RPC
+    // (`zd_sponsorUserOperation`) on a busy network. Transient + retryable, so
+    // tell the user to try again instead of the generic "contact support".
+    // `timed out after` also covers our own `fetchWithSentry` AbortError copy
+    // ("Request to <url> timed out after <ms>ms") — without it, every server
+    // fetch timeout fell through to the generic "contact support" fallback
+    // (Sentry PEANUT-UI-QH9, Bridge offramp /confirm). Callers that move money
+    // must still gate Retry separately — see WithdrawBankPage.
+    if (
+        text.includes('took too long to respond') ||
+        text.includes('The request timed out') ||
+        text.includes('timed out after')
+    )
+        return 'The network is busy and your request timed out. Please try again in a moment.'
     return 'There was an issue with your request. Please contact support.'
 }

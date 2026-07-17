@@ -10,6 +10,37 @@ export interface CurrencyConfig {
 export type BridgeOperationType = 'onramp' | 'offramp'
 
 /**
+ * Map a country selection to the rail-jurisdiction code its bank rail uses
+ * in the capability model. Bridge SEPA rails are stored with country='EU'
+ * (one rail spans all 27 EU member states); ACH/SPEI/Faster Payments use
+ * their own ISO2. Manteca rails are stored under the user's country
+ * (BR/AR). Used by deposit/withdraw bank pages to country-scope the
+ * capability gate so a stuck PENDING rail in country X doesn't block
+ * country Y's flow (e.g. a ghost BANK_TRANSFER_AR rail shouldn't keep the
+ * Portugal-SEPA page in a "Setting up your account…" wait loop).
+ *
+ * Contract:
+ * - missing input (null/undefined/empty) → undefined; the gate falls back
+ *   to a channel-only scope.
+ * - recognized US/MX/GB/AR/BR → the matching ISO2 code.
+ * - anything else → 'EU'. This intentionally mirrors `getCurrencyConfig`'s
+ *   "everything else → SEPA/EUR" default. Returning undefined here would
+ *   re-introduce the original bug (unscoped gate sees stuck pending rails
+ *   from unrelated jurisdictions); Bridge serves every other country we
+ *   support via SEPA, so 'EU' is the right scope for any unmapped entry.
+ */
+export const railJurisdictionForBank = (countryId: string | null | undefined): string | undefined => {
+    if (!countryId) return undefined
+    const upper = countryId.toUpperCase()
+    if (upper === 'US' || upper === 'USA') return 'US'
+    if (upper === 'MX' || upper === 'MEX') return 'MX'
+    if (upper === 'GB' || upper === 'GBR') return 'GB'
+    if (upper === 'AR' || upper === 'ARG') return 'AR'
+    if (upper === 'BR' || upper === 'BRA') return 'BR'
+    return 'EU'
+}
+
+/**
  * Get currency configuration for a specific country and operation type
  * USA -> USD/ACH, Mexico -> MXN/SPEI, everything else -> EUR/SEPA
  * Payment rails differ between onramp and offramp operations
@@ -48,6 +79,37 @@ export const getCurrencyConfig = (countryId: string, operationType: BridgeOperat
  */
 export const getOfframpCurrencyConfig = (countryId: string): CurrencyConfig => {
     return getCurrencyConfig(countryId, 'offramp')
+}
+
+/**
+ * Derive the offramp destination currency + payment rail from the bank
+ * account's actual `type`, falling back to country only when the type is
+ * unknown.
+ *
+ * Why: `getOfframpCurrencyConfig(country)` defaults *any* unknown country to
+ * EUR+SEPA. Pairing that default with a GBP/UK account caused Bridge to 400
+ * with "country is not supported for SEPA" (PEANUT-API-5P/5M/5N, 2026-06-02
+ * 21:24 UTC) — Bridge can't SEPA-credit a GBP account. The bank account's
+ * `type` already carries the right answer for every Bridge destination we
+ * support (`us`/`gb`/`clabe`/`iban`), so derive from it directly.
+ *
+ * Manteca-type accounts use a non-Bridge rail; the caller must NOT route
+ * those through this helper. We throw rather than silently misclassify.
+ */
+export const getOfframpConfigFromAccount = (account: {
+    type?: string | AccountType | null
+    country?: string | null
+}): CurrencyConfig => {
+    const t = account.type?.toString().toLowerCase()
+    if (t === AccountType.US || t?.endsWith('ach') || t?.endsWith('us')) return getCurrencyConfig('US', 'offramp')
+    if (t === AccountType.GB || t?.endsWith('gb')) return getCurrencyConfig('GB', 'offramp')
+    if (t === AccountType.CLABE || t?.endsWith('clabe')) return getCurrencyConfig('MX', 'offramp')
+    if (t === AccountType.IBAN || t?.endsWith('iban')) return getCurrencyConfig('EU', 'offramp')
+    if (t === AccountType.MANTECA || t?.endsWith('manteca')) {
+        throw new Error('Manteca accounts route through a separate offramp path, not Bridge.')
+    }
+    // type missing / unknown — fall back to country, preserving prior behavior.
+    return getOfframpCurrencyConfig(account.country ?? 'EU')
 }
 
 /**

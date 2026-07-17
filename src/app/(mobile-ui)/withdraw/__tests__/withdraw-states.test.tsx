@@ -96,10 +96,14 @@ jest.mock('@/utils/general.utils', () => ({
     formatNumberForDisplay: jest.fn((v: any) => v ?? '0'),
 }))
 
+const mockGetCountryFromAccount = jest.fn(
+    () => ({ iso2: 'US', path: 'us' }) as { iso2: string; path: string } | undefined
+)
 jest.mock('@/utils/bridge.utils', () => ({
-    getCountryFromAccount: jest.fn(() => ({ iso2: 'US', path: 'us' })),
-    getCountryFromPath: jest.fn(() => ({ iso2: 'US' })),
+    getCountryFromAccount: mockGetCountryFromAccount,
+    getCountryFromPath: jest.fn(() => ({ iso2: 'US', id: 'US' })),
     getMinimumAmount: jest.fn(() => 1),
+    railJurisdictionForBank: jest.fn(() => 'US'),
 }))
 
 const mockUseGetExchangeRate = jest.fn()
@@ -244,7 +248,11 @@ function applyDefaults() {
     mockWithdrawFlow.selectedBankAccount = null
 
     mockUseWallet.mockReturnValue({
-        balance: parseUnits('100', 6),
+        // component gates on the displayed `spendableBalance` (= maxDecimalAmount).
+        spendableBalance: parseUnits('100', 6),
+        formattedSpendableBalance: '100.00',
+        // amount-aware: over-$100 entries are a true shortfall
+        hasSufficientSpendableBalance: (amt: string | number) => Number(amt) <= 100,
     })
 
     mockUseGetExchangeRate.mockReturnValue({
@@ -265,6 +273,10 @@ beforeEach(() => {
     jest.clearAllMocks()
     mockSearchParams.clear()
     applyDefaults()
+    // clearAllMocks() resets call history but not implementations, so restore
+    // the default country resolution here — tests that override it (GROUP 6)
+    // then don't leak into later tests regardless of order or early failure.
+    mockGetCountryFromAccount.mockReturnValue({ iso2: 'US', path: 'us' })
 })
 
 // ============================================================
@@ -355,10 +367,10 @@ describe('GROUP 3: Amount Validation', () => {
 
     test('Error state shows ErrorAlert', () => {
         mockWithdrawFlow.selectedMethod = { type: 'bridge', countryPath: 'us' }
-        mockWithdrawFlow.error = { showError: true, errorMessage: 'Amount exceeds your wallet balance.' }
+        mockWithdrawFlow.error = { showError: true, errorMessage: 'Not enough balance. Add funds to continue.' }
         renderWithdraw()
 
-        expect(screen.getByTestId('error-alert')).toHaveTextContent('Amount exceeds your wallet balance.')
+        expect(screen.getByTestId('error-alert')).toHaveTextContent('Not enough balance. Add funds to continue.')
     })
 
     test('Error hidden when limits blocking card is displayed', () => {
@@ -381,6 +393,51 @@ describe('GROUP 3: Amount Validation', () => {
         // ErrorAlert should NOT be shown when limits is blocking
         expect(screen.queryByTestId('error-alert')).not.toBeInTheDocument()
         expect(screen.getByTestId('limits-warning-card')).toBeInTheDocument()
+    })
+
+    test('Crypto withdrawal allows sub-$1 amounts (no fiat-rail minimum)', () => {
+        // Regression: the shared amount step applied the bank $1 minimum to
+        // crypto (getMinimumAmount('') → 1), blocking sub-$1 on-chain sends
+        // that send-via-link already allows.
+        mockWithdrawFlow.selectedMethod = { type: 'crypto' }
+        mockWithdrawFlow.amountToWithdraw = '0.5'
+
+        renderWithdraw()
+
+        const continueBtn = screen.getByText('Continue')
+        expect(continueBtn).not.toBeDisabled()
+
+        fireEvent.click(continueBtn)
+        expect(mockRouterPush).toHaveBeenCalledWith('/withdraw/crypto')
+    })
+
+    test('Bank withdrawal keeps the $1 minimum for sub-$1 amounts', async () => {
+        mockWithdrawFlow.selectedMethod = { type: 'bridge', countryPath: 'us' }
+        mockWithdrawFlow.amountToWithdraw = '0.5'
+
+        renderWithdraw()
+
+        expect(screen.getByText('Continue')).toBeDisabled()
+        // validation is debounced 300ms behind typing
+        await waitFor(() =>
+            expect(mockSetError).toHaveBeenCalledWith({
+                showError: true,
+                errorMessage: 'Minimum withdrawal is $1.',
+            })
+        )
+    })
+
+    test('Stale bank method entering via ?method=crypto keeps the bank minimum', () => {
+        // Regression: the crypto exemption must follow selectedMethod (the
+        // routing source of truth), not the URL param. A leftover bank method
+        // from an abandoned withdraw survives in the app-wide context and
+        // still routes Continue to the bank flow — so sub-$1 must stay blocked.
+        mockWithdrawFlow.selectedMethod = { type: 'bridge', countryPath: 'us' }
+        mockWithdrawFlow.amountToWithdraw = '0.5'
+
+        renderWithdraw({ method: 'crypto' })
+
+        expect(screen.getByText('Continue')).toBeDisabled()
     })
 })
 
@@ -469,5 +526,58 @@ describe('GROUP 5: Navigation', () => {
         expect(mockSetSelectedMethod).toHaveBeenCalledWith(null)
         expect(mockSetAmountToWithdraw).toHaveBeenCalledWith('')
         expect(mockSetSelectedBankAccount).toHaveBeenCalledWith(null)
+    })
+})
+
+// ============================================================
+// GROUP 6: Continue must never silently die (regression)
+// ============================================================
+describe('GROUP 6: Continue never dead-buttons', () => {
+    test('Unresolved bank-account country shows an error instead of throwing (dead button)', () => {
+        // Regression for the "press Continue, nothing happens" report: when
+        // getCountryFromAccount can't resolve a country, the handler used to
+        // `throw` inside onClick — aborting the router transition with no UI
+        // feedback (Sentry: incomplete-app-router-transaction, 6 users/14d).
+        mockGetCountryFromAccount.mockReturnValue(undefined)
+
+        mockUseWallet.mockReturnValue({
+            spendableBalance: parseUnits('100', 6),
+            formattedSpendableBalance: '100.00',
+            hasSufficientSpendableBalance: (amt: string | number) => Number(amt) <= 100,
+        })
+        mockWithdrawFlow.selectedMethod = { type: 'bridge', countryPath: 'us' }
+        mockWithdrawFlow.selectedBankAccount = { type: 'iban', details: { countryName: '', countryCode: '' } }
+        mockWithdrawFlow.amountToWithdraw = '50'
+
+        renderWithdraw()
+
+        // Pressing Continue must NOT throw and must NOT navigate...
+        expect(() => fireEvent.click(screen.getByText('Continue'))).not.toThrow()
+        expect(mockRouterPush).not.toHaveBeenCalled()
+        // ...it surfaces a recoverable error instead.
+        expect(mockSetError).toHaveBeenCalledWith({
+            showError: true,
+            errorMessage: "We couldn't determine this account's country. Please contact support.",
+        })
+    })
+
+    test('Manteca account routes to the Manteca flow, not the bank branch', () => {
+        // Manteca (AR/BR) accounts set selectedBankAccount too; the manteca
+        // method check must win over the generic bank branch so they reach
+        // /withdraw/manteca rather than the Bridge bank page (or the throw).
+        mockUseWallet.mockReturnValue({
+            spendableBalance: parseUnits('100', 6),
+            formattedSpendableBalance: '100.00',
+            hasSufficientSpendableBalance: (amt: string | number) => Number(amt) <= 100,
+        })
+        mockWithdrawFlow.selectedMethod = { type: 'manteca', countryPath: 'argentina', title: 'Bank Transfer' }
+        mockWithdrawFlow.selectedBankAccount = { type: 'manteca', details: { countryName: 'argentina' } }
+        mockWithdrawFlow.amountToWithdraw = '50'
+
+        renderWithdraw()
+
+        fireEvent.click(screen.getByText('Continue'))
+        expect(mockRouterPush).toHaveBeenCalledWith(expect.stringContaining('/withdraw/manteca'))
+        expect(mockRouterPush).toHaveBeenCalledWith(expect.stringContaining('country=argentina'))
     })
 })

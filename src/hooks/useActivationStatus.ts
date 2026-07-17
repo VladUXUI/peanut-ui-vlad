@@ -2,11 +2,12 @@
 
 import { useAuth } from '@/context/authContext'
 import { useWallet } from '@/hooks/wallet/useWallet'
-import useKycStatus from '@/hooks/useKycStatus'
+import { useCapabilities } from '@/hooks/useCapabilities'
 import { useRainCardOverview } from '@/hooks/useRainCardOverview'
 import { useQuery } from '@tanstack/react-query'
 import { cardApi, type CardInfoResponse } from '@/services/card'
 import { findActiveCard } from '@/components/Card/cardState.utils'
+import underMaintenanceConfig from '@/config/underMaintenance.config'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
 export type ActivationStep = 'verify' | 'deposit' | 'card' | 'outbound' | 'completed'
@@ -42,7 +43,7 @@ const CARD_DISMISSED_STORAGE_KEY = 'peanut_card_activation_dismissed'
 export function useActivationStatus(): ActivationStatus {
     const { user } = useAuth()
     const { balance, isFetchingBalance } = useWallet()
-    const { isUserKycApproved } = useKycStatus()
+    const { isKycApproved } = useCapabilities()
     const { overview } = useRainCardOverview()
     const userId = user?.user?.userId
 
@@ -92,7 +93,7 @@ export function useActivationStatus(): ActivationStatus {
                 }
                 activationStep = milestoneToStep[beMilestone] ?? 'verify'
             } else {
-                if (!isUserKycApproved) {
+                if (!isKycApproved) {
                     activationStep = 'verify'
                 } else {
                     activationStep = hasBalance ? 'outbound' : 'deposit'
@@ -100,19 +101,34 @@ export function useActivationStatus(): ActivationStatus {
             }
         }
 
-        // Insert the card step between `deposit` and `outbound`: user has
-        // funded but hasn't taken the card yet. Skipped if they can't access
-        // the card flow, already have a card, or explicitly dismissed.
-        if (activationStep === 'outbound') {
-            const hasCardAccess = cardInfo?.hasCardAccess ?? false
-            const hasCard = !!findActiveCard(overview)
-            if (hasCardAccess && !hasCard && !cardDismissed) {
-                activationStep = 'card'
-            }
+        // Card takes priority for eligible users. An eligible user is one who
+        // holds a skip badge (e.g. WAITLIST_SKIP) or an explicit admin grant —
+        // both collapse into `cardInfo.hasCardAccess` on the BE, so gating here
+        // IS gating on the badge. If they don't yet hold a card and haven't
+        // dismissed the nudge, steer them straight to the card step (→ /card),
+        // overriding verify/deposit/outbound.
+        //
+        // Why this beats the old "insert between deposit and outbound" rule:
+        // the /card flow runs KYC on the `rain-requirements` Sumsub level,
+        // which does NOT send a regionIntent and does NOT enroll Bridge bank
+        // rails. The verify step instead routes to the region picker, where an
+        // EU/NA user gets `bridge-requirements` + auto-enrolled Bridge rails —
+        // the source of the "blocked by Bridge / proof of address" detours for
+        // users who only ever wanted a card. Surfacing card first keeps them
+        // off that path. Also fires for already-activated users who simply
+        // never took the card (the funnel would otherwise be `completed`).
+        const hasCardAccess = cardInfo?.hasCardAccess ?? false
+        const hasCard = !!findActiveCard(overview)
+        // The in-app card CTA is delay-gated for launch (see disableCardLaunchCTA):
+        // muted now, flipped on a few days post-launch. While muted, badge/access
+        // users fall through to the normal verify → deposit → outbound funnel;
+        // /card itself stays reachable (door, waitlist pill, direct link).
+        if (hasCardAccess && !hasCard && !cardDismissed && !underMaintenanceConfig.disableCardLaunchCTA) {
+            activationStep = 'card'
         }
 
         return { isActivated, activatedAt, activationStep }
-    }, [user?.user, isUserKycApproved, balance, cardInfo?.hasCardAccess, overview, cardDismissed])
+    }, [user?.user, isKycApproved, balance, cardInfo?.hasCardAccess, overview, cardDismissed])
 
     return { ...derived, isLoading, dismissCardStep }
 }

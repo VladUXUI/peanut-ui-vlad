@@ -39,9 +39,9 @@ export const rpcUrls: Record<number, string[]> = {
         // 'https://rpc.ankr.com/arbitrum', // requires API key
     ].filter(Boolean) as string[],
     [arbitrumSepolia.id]: [
-        // infuraUrl('arbitrum-sepolia'),
-        // alchemyUrl('arb-sepolia'),
-        'https://sepolia-rollup.arbitrum.io/rpc', // Official Arbitrum Sepolia
+        'https://arbitrum-sepolia.publicnode.com', // publicnode (primary) — keyless, CORS *, reliable
+        'https://arbitrum-sepolia.drpc.org', // drpc — keyless fallback
+        'https://sepolia-rollup.arbitrum.io/rpc', // Official Arbitrum Sepolia (503-prone) — last resort
     ].filter(Boolean) as string[],
     [polygon.id]: [
         'https://polygon-mainnet.core.chainstack.com/e8d733c7341e28d98e4cf66c61c42aa6', // Chainstack (primary)
@@ -250,3 +250,6 @@ export const ROUTE_NOT_FOUND_ERROR =
 export const PERK_HOLD_DURATION_MS = 1500 // 1.5 seconds hold duration for claiming perks
 
 export const ENS_NAME_REGEX = /^(?:[-a-zA-Z0-9]+\.)+[-a-zA-Z0-9]+$/
+
+// Mirrors the backend username minimum (USERNAME_REGEX = /^[a-z][a-z0-9]{3,11}$/).
+export const USERNAME_MIN_LENGTH = 4

@@ -1,6 +1,6 @@
 'use client'
 
-import { HandThumbsUpV2, PEANUT_LOGO_BLACK, PEANUTMAN_LOGO } from '@/assets'
+import { HandThumbsUpV2, PEANUT_LOGO_BLACK, PEANUTMAN } from '@/assets'
 import { Button } from '@/components/0_Bruddle/Button'
 import { Icon } from '@/components/Global/Icons/Icon'
 import NavHeader from '@/components/Global/NavHeader'
@@ -16,7 +16,6 @@ import { checkIfInternalNavigation } from '@/utils/general.utils'
 import { useAuth } from '@/context/authContext'
 import ShareButton from '@/components/Global/ShareButton'
 import ActionModal from '@/components/Global/ActionModal'
-import { isUserKycVerified } from '@/constants/kyc.consts'
 import BadgesRow from '@/components/Badges/BadgesRow'
 
 interface PublicProfileProps {
@@ -55,7 +54,7 @@ const PublicProfile: React.FC<PublicProfileProps> = ({ username, isLoggedIn = fa
             if (apiUser?.fullName) setFullName(apiUser.fullName)
             // get the profile owner's showFullName preference
             setShowFullName(apiUser?.showFullName ?? false)
-            setIsKycVerified(isUserKycVerified(apiUser))
+            setIsKycVerified(apiUser?.isVerified ?? false)
             // to check if the logged in user has sent money to the profile user,
             // we check the amount that the profile user has received from the logged in user.
             if (apiUser?.totalUsdReceivedFromCurrentUser) {
@@ -77,7 +76,7 @@ const PublicProfile: React.FC<PublicProfileProps> = ({ username, isLoggedIn = fa
             <div>
                 {!isLoggedIn ? (
                     <div className="flex items-center gap-2 md:hidden">
-                        <Image src={PEANUTMAN_LOGO} alt="Peanut Logo" height={24} />
+                        <Image src={PEANUTMAN} alt="Peanut mascot" height={24} />
                         <Image src={PEANUT_LOGO_BLACK} alt="Peanut Text" height={12} />
                     </div>
                 ) : (

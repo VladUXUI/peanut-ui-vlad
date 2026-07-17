@@ -1,6 +1,14 @@
 import { type MetadataRoute } from 'next'
 import { BASE_URL } from '@/constants/general.consts'
-import { COUNTRIES_SEO, CORRIDORS, COMPETITORS, EXCHANGES, DEPOSIT_RAILS, PAYMENT_METHOD_SLUGS } from '@/data/seo'
+import {
+    COUNTRIES_SEO,
+    CORRIDORS,
+    RECEIVE_SOURCES,
+    COMPETITORS,
+    EXCHANGES,
+    DEPOSIT_RAILS,
+    PAYMENT_METHOD_SLUGS,
+} from '@/data/seo'
 import { SUPPORTED_LOCALES } from '@/i18n/config'
 import { listContentSlugs, listPublishedSlugs } from '@/lib/content'
 
@@ -62,9 +70,8 @@ async function generateSitemap(): Promise<MetadataRoute.Sitemap> {
             })
         }
 
-        // Receive money pages (unique sending countries from corridors)
-        const receiveSources = [...new Set(CORRIDORS.map((c) => c.from))]
-        for (const source of receiveSources) {
+        // Receive money pages — corridor origins that have a receive-from article
+        for (const source of RECEIVE_SOURCES) {
             pages.push({
                 path: `/${locale}/receive-money-from/${source}`,
                 priority: 0.7 * basePriority,
@@ -168,7 +175,27 @@ async function generateSitemap(): Promise<MetadataRoute.Sitemap> {
             changeFrequency: 'monthly',
         })
 
-        // Blog and team pages excluded from production sitemap (not yet launched)
+        // Content hub + blog
+        pages.push({
+            path: `/${locale}/content`,
+            priority: 0.7 * basePriority,
+            changeFrequency: 'weekly',
+        })
+        pages.push({
+            path: `/${locale}/blog`,
+            priority: 0.7 * basePriority,
+            changeFrequency: 'weekly',
+        })
+        for (const slug of listContentSlugs('blog')) {
+            if (slug === 'index') continue
+            pages.push({
+                path: `/${locale}/blog/${slug}`,
+                priority: 0.6 * basePriority,
+                changeFrequency: 'monthly',
+            })
+        }
+
+        // Team pages excluded from production sitemap (not yet launched)
     }
 
     return pages.map((page) => ({

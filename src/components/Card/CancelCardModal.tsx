@@ -10,9 +10,9 @@ import SlideToAction from '@/components/Card/SlideToAction'
 import { rainApi } from '@/services/rain'
 import { RAIN_CARD_OVERVIEW_QUERY_KEY, useRainCardOverview } from '@/hooks/useRainCardOverview'
 import { useSignSpendBundle } from '@/hooks/wallet/useSignSpendBundle'
-import { InsufficientSpendableError, SessionKeyGrantRequiredError } from '@/hooks/wallet/useSpendBundle'
+import { InsufficientSpendableError, SessionKeyGrantRequiredError } from '@/hooks/wallet/spendPreflight'
 import { useWallet } from '@/hooks/wallet/useWallet'
-import { rainSpendingPowerToWei } from '@/utils/balance.utils'
+import { rainCentsToUsdcUnits } from '@/utils/balance.utils'
 
 type Phase = 'confirm' | 'canceling' | 'feedback' | 'submitting-feedback' | 'thanks'
 
@@ -60,18 +60,17 @@ const CancelCardModal: FC<Props> = ({ cardId, isOpen, onClose }) => {
             // Cancel can be terminal on Rain's side (collateral contract may
             // become unreachable), so we MUST drain it BEFORE the cancel.
             // Backend enforces order — this just delivers the signed body.
-            const spendingPowerWei = rainSpendingPowerToWei(overview?.balance?.spendingPower)
+            const spendingPowerUnits = rainCentsToUsdcUnits(overview?.balance?.spendingPower)
             let verifiedWithdrawal: import('@/hooks/wallet/useSignSpendBundle').SignedRainWithdrawal | undefined
-            if (spendingPowerWei > 0n) {
+            if (spendingPowerUnits > 0n) {
                 if (!smartWalletAddress) {
                     throw new Error('Wallet not ready — please retry in a moment')
                 }
                 // Force collateral-only routing — same pattern as LockCardModal.
                 const artifact = await signSpend({
-                    requiredUsdcAmount: spendingPowerWei,
+                    requiredUsdcAmount: spendingPowerUnits,
                     recipient: smartWalletAddress as `0x${string}`,
-                    smartBalance: 0n,
-                    rainSpendingPower: spendingPowerWei,
+                    rainSpendingPower: spendingPowerUnits,
                     kind: 'CRYPTO_WITHDRAW',
                 })
                 if (artifact.strategy !== 'collateral-only') {
@@ -131,14 +130,14 @@ const CancelCardModal: FC<Props> = ({ cardId, isOpen, onClose }) => {
         <Modal
             visible={isOpen}
             onClose={handleClose}
-            classWrap="sm:m-auto sm:self-center self-center m-4 rounded-2xl"
+            classWrap="sm:m-auto sm:self-center self-center m-4"
             preventClose={phase === 'canceling' || phase === 'submitting-feedback'}
         >
             <div className="p-6">
                 {phase === 'confirm' || phase === 'canceling' ? (
                     <div className="flex flex-col items-center gap-4 text-center">
                         <div className="flex h-10 w-10 items-center justify-center rounded-full bg-yellow-1">
-                            <Icon name="alert-filled" size={20} />
+                            <Icon name="alert" size={20} />
                         </div>
                         <div className="text-xl font-extrabold">Cancel card?</div>
                         <p className="text-sm text-grey-1">
@@ -151,14 +150,6 @@ const CancelCardModal: FC<Props> = ({ cardId, isOpen, onClose }) => {
                             onComplete={runCancel}
                             disabled={phase === 'canceling'}
                         />
-                        <Button
-                            variant="stroke"
-                            className="w-full"
-                            onClick={handleClose}
-                            disabled={phase === 'canceling'}
-                        >
-                            Close
-                        </Button>
                     </div>
                 ) : phase === 'feedback' || phase === 'submitting-feedback' ? (
                     <div className="flex flex-col items-center gap-4 text-center">
@@ -194,14 +185,6 @@ const CancelCardModal: FC<Props> = ({ cardId, isOpen, onClose }) => {
                         >
                             Submit
                         </Button>
-                        <button
-                            type="button"
-                            onClick={() => setPhase('thanks')}
-                            className="text-black underline"
-                            disabled={phase === 'submitting-feedback'}
-                        >
-                            Close
-                        </button>
                     </div>
                 ) : (
                     <div className="flex flex-col items-center gap-4 text-center">

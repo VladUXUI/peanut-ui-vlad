@@ -54,14 +54,47 @@ export interface SelfHealResubmissionResponse {
     maxAttempts: number
 }
 
+export interface RestartIdentityResponse {
+    token: string
+    levelName: string
+    applicantId: string
+}
+
+/**
+ * Reset the user's Sumsub IDENTITY step and mint a fresh token. Used as the
+ * "Verify with a different document" CTA on a Manteca rail that's blocked
+ * because the user verified with a non-AR/BR document.
+ */
+export const restartIdentityVerification = async (): Promise<{
+    data?: RestartIdentityResponse
+    error?: string
+}> => {
+    try {
+        const response = await serverFetch('/users/identity/restart', { method: 'POST' })
+        const responseJson = await response.json()
+        if (!response.ok) {
+            return {
+                error: responseJson.userMessage || responseJson.error || 'Failed to restart identity verification',
+            }
+        }
+        return { data: responseJson }
+    } catch (e: unknown) {
+        const message = e instanceof Error ? e.message : 'An unexpected error occurred'
+        return { error: message }
+    }
+}
+
 // initiate self-heal document resubmission for a provider-rejected user
 export const initiateSelfHealResubmission = async (
-    provider: 'BRIDGE' | 'MANTECA'
+    provider: 'BRIDGE' | 'MANTECA',
+    // Optional — target a specific (e.g. future-dated advisory) Bridge requirement
+    // by key. Omitted for the legacy blocking flow (current nextAction).
+    requirementKey?: string
 ): Promise<{ data?: SelfHealResubmissionResponse; error?: string }> => {
     try {
         const response = await serverFetch('/users/identity/resubmit', {
             method: 'POST',
-            body: JSON.stringify({ provider }),
+            body: JSON.stringify({ provider, ...(requirementKey ? { requirementKey } : {}) }),
         })
 
         const responseJson = await response.json()
@@ -77,6 +110,47 @@ export const initiateSelfHealResubmission = async (
         }
 
         return { data: responseJson }
+    } catch (e: unknown) {
+        const message = e instanceof Error ? e.message : 'An unexpected error occurred'
+        return { error: message }
+    }
+}
+
+export interface StartKycActionResponse {
+    token: string
+    levelName: string
+    externalActionId?: string
+}
+
+/**
+ * Mint a Sumsub WebSDK token for a capability nextAction by its `key`
+ * (POST /users/kyc/start-action). The capability model returns action
+ * descriptors (a stable key + a registry levelKey) and never carries a token;
+ * the FE posts the key here to get an unexpired token bound to the right RFI
+ * level. Used by the advisory pre-empt — an already-approved user starting a
+ * future-dated RFI early, where /users/identity would short-circuit on
+ * "already approved" and never mint a token.
+ */
+export const startKycAction = async (key: string): Promise<{ data?: StartKycActionResponse; error?: string }> => {
+    try {
+        const response = await serverFetch('/users/kyc/start-action', {
+            method: 'POST',
+            body: JSON.stringify({ key }),
+        })
+        const responseJson = await response.json()
+        if (!response.ok) {
+            return { error: responseJson.userMessage || responseJson.error || 'Failed to start verification' }
+        }
+        if (!responseJson.sumsubAccessToken) {
+            return { error: 'Invalid response from server' }
+        }
+        return {
+            data: {
+                token: responseJson.sumsubAccessToken,
+                levelName: responseJson.levelName,
+                externalActionId: responseJson.externalActionId,
+            },
+        }
     } catch (e: unknown) {
         const message = e instanceof Error ? e.message : 'An unexpected error occurred'
         return { error: message }

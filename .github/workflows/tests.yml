@@ -32,8 +32,6 @@ jobs:
                   token: ${{ secrets.SUBMODULE_TOKEN }}
 
             - uses: pnpm/action-setup@v4
-              with:
-                  version: 10
 
             - uses: actions/setup-node@v4
               with:
@@ -45,11 +43,17 @@ jobs:
             - name: Check formatting
               run: pnpm prettier --check .
 
-            # Validates content-submodule integrity. Currently advisory
-            # because of unrelated content-baseline drift.
-            - name: Validate internal links
+            # Validates content-submodule integrity. BLOCKING — runs the
+            # 11-pass verify-content suite, including:
+            #   • Pass 1: every /...link in published blog/country/etc. markdown
+            #     resolves to a static route
+            #   • Pass 3: every href in the homepage footer-manifest resolves
+            #   • Pass 11: every URL `sitemap.ts` would emit has a matching
+            #     static route AND its data source is non-empty (catches the
+            #     May 2026 SEO-loader regression where `generateStaticParams`
+            #     returned [] and silently 404-ed ~625 SEO pages).
+            - name: Validate sitemap, footer, and blog links
               run: pnpm validate-links
-              continue-on-error: true
 
     # Advisory ESLint pass. Allowed to fail without blocking merge while the
     # codebase is brought up to baseline. Not in ci-success.needs so a red
@@ -65,8 +69,6 @@ jobs:
                   token: ${{ secrets.SUBMODULE_TOKEN }}
 
             - uses: pnpm/action-setup@v4
-              with:
-                  version: 10
 
             - uses: actions/setup-node@v4
               with:
@@ -89,8 +91,6 @@ jobs:
                   token: ${{ secrets.SUBMODULE_TOKEN }}
 
             - uses: pnpm/action-setup@v4
-              with:
-                  version: 10
 
             - uses: actions/setup-node@v4
               with:
@@ -118,8 +118,6 @@ jobs:
                   token: ${{ secrets.SUBMODULE_TOKEN }}
 
             - uses: pnpm/action-setup@v4
-              with:
-                  version: 10
 
             - uses: actions/setup-node@v4
               with:
@@ -186,8 +184,6 @@ jobs:
                   token: ${{ secrets.SUBMODULE_TOKEN }}
 
             - uses: pnpm/action-setup@v4
-              with:
-                  version: 10
 
             - uses: actions/setup-node@v4
               with:

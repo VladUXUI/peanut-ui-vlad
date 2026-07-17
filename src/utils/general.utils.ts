@@ -16,7 +16,6 @@ import { NATIVE_TOKEN_ADDRESS, NATIVE_TOKEN_PROXY_ADDRESS } from '@/constants/to
 import { toWebAuthnKey } from '@zerodev/passkey-validator'
 import { USER_OPERATION_REVERT_REASON_TOPIC } from '@/constants/zerodev.consts'
 import { CHAIN_LOGOS, TOKEN_LOGOS, type ChainName, type TokenName } from '@/constants/rhino.consts'
-import { isUserKycVerified } from '@/constants/kyc.consts'
 
 export const shortenAddress = (address?: string, chars?: number) => {
     if (!address) return ''
@@ -138,7 +137,9 @@ export const saveToLocalStorage = (key: string, data: any, expirySeconds?: numbe
         } else {
             localStorage.removeItem(`${key}-expiry`)
         }
-        console.log(`Saved ${key} to localStorage:`, data)
+        // key is passed as an argument (not interpolated into the format string)
+        // so a user-controlled key can't act as a console format string (CodeQL).
+        console.log('Saved to localStorage:', key, data)
     } catch (error) {
         Sentry.captureException(error)
         console.error('Error saving to localStorage:', error)
@@ -560,12 +561,6 @@ interface TransferDetails {
     details: any
 }
 
-interface Portfolio {
-    id: string
-    ownerAddress: string
-    assetActivities: TransferDetails[]
-}
-
 export function formatDate(date: Date | null | undefined): string {
     // Receipts and timeline rows pass dates that may be missing for paths
     // that haven't reached that lifecycle event yet (e.g. cancelledDate on a
@@ -878,24 +873,21 @@ export function slugify(text: string): string {
 }
 
 /**
- * Generate a deterministic 3-digit suffix from username — pure hash.
+ * Canonical invite-code shape: a bare, lowercased username (e.g. `alice`).
  *
- * Duplicated on the backend (peanut-api-ts/src/utils/invite.ts). Parity is
- * enforced by shared test vectors in __tests__/invite-suffix.test.ts and
- * peanut-api-ts/src/utils/invite.test.ts. Don't edit one without the other.
+ * Single source of truth — use this anywhere an invite code is built for
+ * `/invite?code=…` or `acceptInvite`. The legacy `ALICEINVITESYOU610` /
+ * `ALICEINVITESYOU` shapes are no longer emitted, but stay fully supported on
+ * the backend (peanut-api-ts `extractUsernameFromInvite` uppercases the input
+ * and matches the old suffixes), so existing shared links keep working.
+ *
+ * Also tolerates hand-typed input ("Who invited you?" asks for a username, so
+ * people paste `@alice ` or ` Alice`): trims whitespace and strips a leading @.
  */
-export const generateInviteCodeSuffix = (username: string): string => {
-    const lowerUsername = username.toLowerCase()
-    // Create a simple hash from the username
-    const hash = lowerUsername.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0)
-    // Generate 3 digits between 100-999
-    const threeDigits = 100 + (hash % 900)
-    return threeDigits.toString()
-}
+export const toInviteCode = (username: string): string => username.trim().replace(/^@/, '').toLowerCase()
 
 export const generateInviteCodeLink = (username: string) => {
-    const suffix = generateInviteCodeSuffix(username)
-    const inviteCode = `${username.toUpperCase()}INVITESYOU${suffix}`
+    const inviteCode = toInviteCode(username)
     const inviteLink = shareableUrl(`/invite?code=${inviteCode}`)
     return { inviteLink, inviteCode }
 }
@@ -953,7 +945,14 @@ export const getContributorsFromCharge = (charges: ChargeEntry[]) => {
             amount: charge.tokenAmount,
             username,
             fulfillmentPayment: charge.fulfillmentPayment,
-            isUserVerified: isUserKycVerified(payerAccount?.user),
+            // FOLLOW-UP (tracked, not in this PR pair): the charges/payments BE flow
+            // still returns raw `bridgeKycStatus` on Payment.payerAccount.user. The
+            // user endpoints (/users/:userId, /users/username/:username,
+            // /users/contacts) all migrated to a BE-computed `isVerified` boolean;
+            // bringing the charges flow along requires a focused refactor (project at
+            // intentToCharge + fetchPayerAccounts; change mutation patterns in
+            // charge/service.ts to immutable response building). Scoped separately.
+            isUserVerified: payerAccount?.user?.bridgeKycStatus === 'approved',
             isPeanutUser,
         }
     })

@@ -30,9 +30,20 @@ export interface SdaTransferRequest {
     /** Rhino chain name (e.g. ARBITRUM, BASE). */
     depositChain: string
     destinationChain: string
-    destinationAddress: Address
+    /** 0x for EVM destinations, base58 for Solana/Tron — the BE forwards it
+     *  to Rhino, which validates per destination chain. */
+    destinationAddress: string
     tokenOut: RhinoSupportedToken
     senderPeanutWalletAddress?: Address
+    /**
+     * Rhino quote economics from the immediately-preceding /preview, echoed so
+     * the backend persists them onto the charge intent and books the bridge
+     * FEE ledger entry at settlement. Omitted for claim-xchain (no charge).
+     * `payAmount`/`receiveAmount` are destination-token decimal strings.
+     */
+    feeUsd?: number
+    payAmount?: string
+    receiveAmount?: string
 }
 
 export interface SdaTransferResult {

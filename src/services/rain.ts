@@ -8,6 +8,8 @@
  */
 
 import Cookies from 'js-cookie'
+import posthog from 'posthog-js'
+import { ANALYTICS_EVENTS } from '@/constants/analytics.consts'
 import { PEANUT_API_KEY, PEANUT_API_URL } from '@/constants/general.consts'
 import { fetchWithSentry } from '@/utils/sentry.utils'
 import type { SignedRainWithdrawal } from '@/hooks/wallet/useSignSpendBundle'
@@ -31,6 +33,13 @@ export interface RainCardBalance {
     pendingCharges: number
     postedCharges: number
     balanceDue: number
+    /**
+     * Card collateral top-up funds debited from the smart account on-chain but
+     * not yet credited to Rain collateral (the ~10–45s smart→collateral
+     * handoff). Folded into the displayed balance so it doesn't crater to 0
+     * mid-top-up. Optional for backward-compat with a pre-deploy backend.
+     */
+    inTransitToCollateralCents?: number
 }
 
 export interface RainCardSummary {
@@ -75,7 +84,7 @@ export type RainCollateralKind =
 
 export interface PrepareRainWithdrawalInput {
     /** Rain cents (2dp), as a decimal string. e.g. `"500"` for $5.00.
-     *  Convert from USDC wei via `usdcWeiToRainCents` at the boundary. */
+     *  Convert from USDC wei via `usdcUnitsToRainCents` at the boundary. */
     amount: string
     recipientAddress: string
     directTransfer: boolean
@@ -129,6 +138,33 @@ export interface SubmitRainWithdrawalResponse {
     txHash: string
 }
 
+// ─── Funds-recovery types ────────────────────────────────────────────────────
+//
+// Recovery is for the deleted-Rain-user case: Rain's balance endpoint stops
+// returning the collateral, but the on-chain USDC is still there and Rain's
+// signature endpoint still works. The server determines amount + recipient;
+// the FE just signs the admin EIP-712 over what the server gives it. See
+// peanut-api-ts/src/routes/rain/recover-funds.ts for the contract.
+
+export interface RecoverFundsPreviewResponse {
+    collateralProxy: string
+    /** The user's own smart-wallet address — the only allowed recipient. */
+    recipient: string
+    /** Full on-chain USDC balance in token smallest units (6 dp). */
+    amountWei: string
+    /** Recoverable amount in Rain cents (2 dp). */
+    amountCents: string
+    /** Wei below one cent — stays in the contract after recovery. */
+    dustWei: string
+    autoBalanceEnabled: boolean
+    hasRecoverableCard: boolean
+}
+
+export interface PrepareRecoverFundsResponse extends PrepareRainWithdrawalResponse {
+    amountCents: string
+    dustWei: string
+}
+
 // ─── Types for card management endpoints ────────────────────────────────────
 
 export interface RainCardDetailsResponse {
@@ -138,6 +174,9 @@ export interface RainCardDetailsResponse {
     expiryYear: number
     last4: string
     network: string
+    /** Registered cardholder name from Rain. Best-effort on the backend, so it
+     *  may be absent if the Rain user lookup failed. */
+    cardholderName?: string
 }
 
 export type RainLimitFrequency = 'perAuthorization' | 'per24HourPeriod' | 'per30DayPeriod' | 'perAllTime'
@@ -158,6 +197,68 @@ export class RainCardRateLimitError extends Error {
         this.name = 'RainCardRateLimitError'
     }
 }
+
+/**
+ * Thrown on 425 from `/rain/cards/withdraw/prepare`. Rain enforces a per-user
+ * lock on withdrawal signatures: one active sig per user at a time, 5min
+ * expiry + ~2min cooldown afterwards. Backend forwards Rain's `retryAfterSec`
+ * when it can extract it from the upstream message; absent that, this is
+ * thrown with `retryAfterSec === null` and the caller surfaces an inline
+ * error string only (no cooldown UI), since we'd be making the number up.
+ *
+ * Side-effect-free: the global cooldown UI is engaged by `rainRequest` when
+ * it constructs this error, NOT by the constructor itself — so logging,
+ * Sentry serialization, and tests can build instances without popping UI.
+ */
+export class RainCooldownError extends Error {
+    readonly retryAfterSec: number | null
+    constructor(message: string, retryAfterSec: number | null) {
+        super(message)
+        this.name = 'RainCooldownError'
+        this.retryAfterSec = retryAfterSec
+    }
+}
+
+export interface RainCooldownEventDetail {
+    retryAfterSec: number
+    message: string
+}
+
+/**
+ * Thrown on 409 `{ code: 'STALE_CARD_APPROVAL' }` from
+ * `/rain/cards/withdraw/submit`. The user's stored card session-key approval is
+ * bound to a deprecated ZeroDev validator that can no longer be sponsored, so
+ * the withdrawal can't be broadcast until the user re-enables their card
+ * (re-grants the session key, which mints a fresh, sponsorable approval).
+ *
+ * `rainRequest` also dispatches a `RAIN_STALE_APPROVAL_EVENT` window event when
+ * it constructs this error, so the global re-enable modal can surface the
+ * recovery CTA on ANY spend path without threading state through the call —
+ * same event-driven pattern as the cooldown 425 above.
+ *
+ * TODO(gen:api): the backend (peanut-api-ts #1143) added `code:
+ * 'STALE_CARD_APPROVAL'` to the withdraw error contract. Once that openapi
+ * lands on dev, run `pnpm gen:api` and branch off the generated union type
+ * instead of this hand-written string literal.
+ */
+export class StaleCardApprovalError extends Error {
+    constructor(message: string) {
+        super(message)
+        this.name = 'StaleCardApprovalError'
+    }
+}
+
+/** The only path that returns a 409 STALE_CARD_APPROVAL — the withdraw submit.
+ *  Gate the branch on it so an unrelated 409 elsewhere stays a generic error. */
+const RAIN_WITHDRAW_SUBMIT_PATH = '/rain/cards/withdraw/submit'
+/** Window event the global re-enable modal listens for. */
+export const RAIN_STALE_APPROVAL_EVENT = 'rain:stale-card-approval'
+
+/** Path that legitimately produces the cooldown 425. Any other 425 from a
+ *  Rain endpoint is treated as a generic upstream error — without this gate,
+ *  an unrelated 425 (e.g. proxy "Too Early") would pop the cooldown modal on
+ *  a totally unrelated screen. */
+const RAIN_COOLDOWN_PATH = '/rain/cards/withdraw/prepare'
 
 /**
  * Response shapes for `POST /rain/cards` — apply for a Rain card.
@@ -185,6 +286,18 @@ export type ApplyForCardResponse =
           status: 'terms-required'
           isUsResident: boolean
           termsVersion: string
+      }
+    | {
+          // Sumsub address country contradicts the ID-document country (or is
+          // junk). Show the residence-confirmation screen; re-call with
+          // `confirmedResidenceCountry` set to one of `candidates`. Empty
+          // `candidates` = neither signal usable → route to support.
+          status: 'country-confirmation-required'
+          candidates: string[]
+          evidence: {
+              addressCountry: string | null
+              idDocumentCountry: string | null
+          }
       }
     | {
           status: 'pending'
@@ -236,6 +349,52 @@ async function rainRequest<T>(opts: RequestOpts): Promise<T> {
     if (response.status === 429 && opts.rateLimitSensitive) {
         const err = await response.json().catch(() => ({}))
         throw new RainCardRateLimitError(err.error || err.message || 'Too many requests')
+    }
+
+    if (response.status === 425 && opts.path === RAIN_COOLDOWN_PATH) {
+        const err = await response.json().catch(() => ({}))
+        // Only engage the cooldown UI when the backend gave us a real
+        // retryAfterSec. Absent that we surface the error inline but don't
+        // invent a countdown the upstream didn't authorize.
+        const retryAfterSec =
+            typeof err.retryAfterSec === 'number' && Number.isFinite(err.retryAfterSec) && err.retryAfterSec > 0
+                ? err.retryAfterSec
+                : null
+        const message =
+            err.error || err.message || 'A previous withdrawal is still active for this card. Try again shortly.'
+        if (typeof window !== 'undefined') {
+            // Captured here — the single point every spend path's cooldown 425
+            // flows through — so all flows get telemetry, including the
+            // retryAfterSec-less shape that shows no cooldown UI at all
+            // (the PEANUT-UI-QJ1 blind spot). Flow context comes from
+            // PostHog's auto-captured $pathname.
+            posthog.capture(ANALYTICS_EVENTS.RAIN_COOLDOWN_HIT, { retry_after_sec: retryAfterSec })
+            if (retryAfterSec !== null) {
+                window.dispatchEvent(
+                    new CustomEvent<RainCooldownEventDetail>('rain:cooldown', {
+                        detail: { retryAfterSec, message },
+                    })
+                )
+            }
+        }
+        throw new RainCooldownError(message, retryAfterSec)
+    }
+
+    if (response.status === 409 && opts.path === RAIN_WITHDRAW_SUBMIT_PATH) {
+        const err = await response.json().catch(() => ({}))
+        // Only the stale-approval discriminant routes to the re-enable flow.
+        // Any other 409 on submit (e.g. "Charge already paid") stays generic.
+        if (err.code === 'STALE_CARD_APPROVAL') {
+            const message =
+                err.error ||
+                'Your card needs to be re-enabled before you can withdraw. Please re-enable your card and try again.'
+            if (typeof window !== 'undefined') {
+                posthog.capture(ANALYTICS_EVENTS.CARD_STALE_APPROVAL_HIT)
+                window.dispatchEvent(new CustomEvent(RAIN_STALE_APPROVAL_EVENT))
+            }
+            throw new StaleCardApprovalError(message)
+        }
+        throw new Error(err.error || err.message || `Request failed: ${response.status}`)
     }
 
     if (!response.ok) {
@@ -292,12 +451,54 @@ export const rainApi = {
      * Submit a prepared withdrawal with the user's admin signature. Backend
      * verifies via ERC-1271 against the user's kernel and broadcasts the
      * coordinator call through the shared admin relayer.
+     *
+     * `/submit` is SYNCHRONOUS: it broadcasts AND awaits on-chain confirmation
+     * (`waitForUserOperationReceipt` + `confirmIntentByTxHash`) before
+     * responding, and for a request/charge it settles the charge in the same
+     * call. That round-trip routinely exceeds the default 10s fetch budget, so
+     * pass 120s — the same budget the verified-withdrawal path already uses for
+     * this exact reason (see line ~525). With the 10s default the FE aborts
+     * while the tx still lands + the charge settles: the user sees an error on a
+     * payment that actually succeeded, retries, and double-sends. (#2245 routed
+     * request payments through this path for the first time → the regression.)
      */
     submitWithdrawal: async (input: SubmitRainWithdrawalInput): Promise<SubmitRainWithdrawalResponse> => {
         return rainRequest<SubmitRainWithdrawalResponse>({
             method: 'POST',
             path: '/rain/cards/withdraw/submit',
             body: input,
+            timeoutMs: 120_000,
+        })
+    },
+
+    /**
+     * Read-only preview of what would be recovered: on-chain USDC balance,
+     * the user's smart-wallet recipient, and the current autoBalanceEnabled
+     * flag. Backed by GET /rain/cards/recover-funds/preview — no side
+     * effects, so safe to call on page mount and on refresh.
+     */
+    getRecoverFundsPreview: async (): Promise<RecoverFundsPreviewResponse> => {
+        return rainRequest<RecoverFundsPreviewResponse>({
+            method: 'GET',
+            path: '/rain/cards/recover-funds/preview',
+            noStore: true,
+        })
+    },
+
+    /**
+     * Side-effectful: flips autoBalanceEnabled to false, reads on-chain
+     * balance, fetches Rain's executor signature for the FULL cent-aligned
+     * amount payable to the user's smart wallet, creates a TransactionIntent.
+     * Returns the prepared payload the caller signs with their kernel and
+     * submits to /rain/cards/withdraw/submit (unchanged).
+     *
+     * Empty body on purpose — amount and recipient are server-locked.
+     */
+    prepareRecoverFunds: async (): Promise<PrepareRecoverFundsResponse> => {
+        return rainRequest<PrepareRecoverFundsResponse>({
+            method: 'POST',
+            path: '/rain/cards/recover-funds/prepare',
+            body: {},
         })
     },
 
@@ -326,12 +527,15 @@ export const rainApi = {
      *    Applicant Action. The token to open it is included.
      *  - `terms-required` → backend is ready to submit but needs explicit
      *    consent; re-call with `termsAccepted: true` to proceed.
+     *  - `country-confirmation-required` → conflicting residence evidence;
+     *    show the confirmation screen and re-call with
+     *    `confirmedResidenceCountry` set to the user's pick.
      *  - `pending` / `ENABLED` / other → application submitted or already
      *    in-flight. Frontend should refetch overview and let the state
      *    machine route.
      */
     applyForCard: async (
-        opts: { termsAccepted?: boolean; serializedApproval?: string } = {}
+        opts: { termsAccepted?: boolean; serializedApproval?: string; confirmedResidenceCountry?: string } = {}
     ): Promise<ApplyForCardResponse> => {
         // `serializedApproval` is consumed only by the re-issue branch on the
         // backend (where a RainCard row is created synchronously). First-time
@@ -339,10 +543,39 @@ export const rainApi = {
         // the field entirely in that case.
         const body: Record<string, unknown> = { termsAccepted: opts.termsAccepted === true }
         if (opts.serializedApproval) body.serializedApproval = opts.serializedApproval
+        if (opts.confirmedResidenceCountry) body.confirmedResidenceCountry = opts.confirmedResidenceCountry
         return rainRequest<ApplyForCardResponse>({
             method: 'POST',
             path: '/rain/cards',
             body,
+            // The first-time-application path runs 7 sequential Sumsub calls, a
+            // deliberate 2.5s readiness sleep, the Rain createApplication call,
+            // and an optional inline issueCard — routinely 7-13s. The default
+            // 10s fetch timeout clips that tail, aborting client-side while the
+            // backend completes (user sees a false failure on a card that was
+            // actually submitted). Give this one call generous headroom.
+            timeoutMs: 60_000,
+        })
+    },
+
+    /**
+     * Cheap polling endpoint for the post-Sumsub WebSDK-close window.
+     *
+     * `applyForCard` is a heavy call — each invocation does `moveToLevel` +
+     * `getApplicant` + `getQuestionnaireAnswers` against Sumsub's API. Polling
+     * it every second for 15s during the async-review race adds up to ~75
+     * Sumsub round-trips per stuck user. This endpoint reads a single
+     * webhook-stamped flag from our DB instead, so it's safe to poll at high
+     * frequency without burning Sumsub rate budget.
+     */
+    getCardApplyReadiness: async (): Promise<{
+        ready: boolean
+        hasApplication: boolean
+        readyAt?: string
+    }> => {
+        return rainRequest<{ ready: boolean; hasApplication: boolean; readyAt?: string }>({
+            method: 'GET',
+            path: '/rain/cards/readiness',
         })
     },
 

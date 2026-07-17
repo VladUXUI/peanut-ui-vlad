@@ -2,7 +2,7 @@
 
 import StatusBadge, { type StatusType } from '@/components/Global/Badges/StatusBadge'
 import TransactionAvatarBadge from '@/components/TransactionDetails/TransactionAvatarBadge'
-import { type TransactionType } from '@/components/TransactionDetails/TransactionCard'
+import { type TransactionDirection, type TransactionType } from '@/components/TransactionDetails/transaction-types'
 import { printableUserHandle } from '@/utils/general.utils'
 import Image from 'next/image'
 import React from 'react'
@@ -12,22 +12,8 @@ import { VerifiedUserLabel } from '../UserHeader'
 import ProgressBar from '../Global/ProgressBar'
 import { useRouter } from 'next/navigation'
 import { twMerge } from 'tailwind-merge'
-import { PEANUTMAN_LOGO } from '@/assets'
+import { PEANUTMAN } from '@/assets/mascot'
 import { profileUrl } from '@/utils/native-routes'
-
-export type TransactionDirection =
-    | 'send'
-    | 'receive'
-    | 'request_sent'
-    | 'request_received'
-    | 'withdraw'
-    | 'add'
-    | 'bank_withdraw'
-    | 'bank_claim'
-    | 'bank_deposit'
-    | 'bank_request_fulfillment'
-    | 'claim_external'
-    | 'qr_payment'
 
 interface TransactionDetailsHeaderCardProps {
     direction: TransactionDirection
@@ -134,7 +120,10 @@ const getTitle = (
                 if (status === 'completed') {
                     titleText = `Paid to ${displayName}`
                 } else if (status === 'failed') {
-                    titleText = `Payment to ${displayName}`
+                    // Failed QR-pays carry a self-contained label from the
+                    // transformer ("Failed QR payment attempt") — no "Payment to"
+                    // prefix, which would read "Payment to Failed QR payment attempt".
+                    titleText = displayName
                 } else {
                     titleText = `Paying to ${displayName}`
                 }
@@ -224,7 +213,7 @@ export const TransactionDetailsHeaderCard: React.FC<TransactionDetailsHeaderCard
             {isTestTransaction ? (
                 <div className="flex items-center gap-3">
                     <div>
-                        <Image src={PEANUTMAN_LOGO} alt="Peanut Logo" width={64} height={64} className="size-8" />
+                        <Image src={PEANUTMAN} alt="Peanut Logo" width={64} height={64} className="size-8" />
                     </div>
                     <div>
                         <h2 className="text-xl font-extrabold">Enjoy Peanut!</h2>

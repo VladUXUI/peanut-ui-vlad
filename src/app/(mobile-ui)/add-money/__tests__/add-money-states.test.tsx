@@ -13,6 +13,7 @@
  * Strategy: mock every hook and service at the module level, then configure
  * per-test via mockReturnValue / mockImplementation.
  */
+/* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unused-vars, @typescript-eslint/no-require-imports, react/display-name, @next/next/no-img-element */
 import React from 'react'
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -111,17 +112,19 @@ jest.mock('@/hooks/wallet/useWallet', () => ({
     useWallet: () => mockUseWallet(),
 }))
 
+// useKycStatus was deleted in the capability rip-out — its jest.mock is removed.
+// The jest.fn is retained only because two legacy setup calls below still call
+// .mockReturnValue on it; they're no-ops now (the component reads useCapabilities).
 const mockUseKycStatus = jest.fn()
-jest.mock('@/hooks/useKycStatus', () => ({
-    __esModule: true,
-    default: () => mockUseKycStatus(),
-}))
 
-const mockGate = jest.fn().mockReturnValue({ type: 'ready' })
-jest.mock('@/hooks/useBridgeTransferReadiness', () => ({
-    useBridgeTransferReadiness: () => ({ gate: mockGate() }),
-    getKycModalVariant: () => 'default',
-    getGateProviderMessage: () => undefined,
+// Bridge gate is now derived inline from useCapabilities() via the real
+// deriveBridgeGate util (bridge-gate.utils is intentionally NOT mocked, so the
+// gate state mapping is exercised end-to-end). Per-test we set fixture rails +
+// nextActions on useCapabilities; `setGate(type)` builds the minimal capability
+// shape that the real deriveBridgeGate resolves to that gate type.
+const mockUseCapabilities = jest.fn()
+jest.mock('@/hooks/useCapabilities', () => ({
+    useCapabilities: () => mockUseCapabilities(),
 }))
 
 jest.mock('@/context/ModalsContext', () => ({
@@ -177,9 +180,9 @@ jest.mock('@/hooks/useMultiPhaseKycFlow', () => ({
     useMultiPhaseKycFlow: (...args: any[]) => mockUseMultiPhaseKycFlow(...args),
 }))
 
-const mockUseBridgeTosGuard = jest.fn()
-jest.mock('@/hooks/useBridgeTosGuard', () => ({
-    useBridgeTosGuard: () => mockUseBridgeTosGuard(),
+const mockUseTosGuard = jest.fn()
+jest.mock('@/hooks/useTosGuard', () => ({
+    useTosGuard: () => mockUseTosGuard(),
 }))
 
 // OnrampFlowContext
@@ -241,6 +244,7 @@ jest.mock('@/utils/bridge.utils', () => ({
         return map[currency] ?? currency
     }),
     getMinimumAmount: jest.fn(() => 1),
+    railJurisdictionForBank: jest.fn(() => 'EU'),
 }))
 
 // Country currency mappings
@@ -252,6 +256,7 @@ jest.mock('@/constants/countryCurrencyMapping', () => ({
     ],
     isNonEuroSepaCountry: jest.fn(() => false),
     isUKCountry: jest.fn(() => false),
+    getFlagUrl: jest.fn((iso2: string) => `/flags/${iso2}.svg`),
 }))
 
 // Rhino consts
@@ -263,8 +268,9 @@ jest.mock('@/constants/rhino.consts', () => ({
     getSupportedTokens: jest.fn(() => [
         { name: 'USDC', logoUrl: '/usdc.png' },
         { name: 'USDT', logoUrl: '/usdt.png' },
+        { name: 'ETH', logoUrl: '/eth-token.png' },
     ]),
-    TOKEN_LOGOS: { USDC: '/usdc.png', USDT: '/usdt.png' },
+    TOKEN_LOGOS: { USDC: '/usdc.png', USDT: '/usdt.png', ETH: '/eth-token.png' },
 }))
 
 jest.mock('@/constants/zerodev.consts', () => ({
@@ -275,11 +281,18 @@ jest.mock('@/constants/zerodev.consts', () => ({
 jest.mock('@/constants/payment.consts', () => ({
     MIN_MANTECA_DEPOSIT_AMOUNT: 1,
     BRIDGE_DEFAULT_ACCOUNT_HOLDER_NAME: 'Bridge Financial',
+    resolveBridgeAccountHolderName: (name?: string | null) => name || 'Bridge Financial',
 }))
 
 jest.mock('@/constants/manteca.consts', () => ({
     MANTECA_ARG_DEPOSIT_CUIT: '30-12345678-9',
     MANTECA_ARG_DEPOSIT_NAME: 'Manteca SA',
+    MANTECA_SUPPORTED_EXCHANGES: {
+        AR: 'ARGENTINA',
+        BR: 'BRAZIL',
+    },
+    isMantecaCountry: (countryPath: string) => ['argentina', 'brazil'].includes(countryPath),
+    isMantecaSupportedCountryCode: (countryCode: string) => ['AR', 'BR'].includes(countryCode?.toUpperCase()),
     MANTECA_COUNTRIES_CONFIG: {
         AR: { depositAddressLabel: 'CBU/CVU' },
         BR: { depositAddressLabel: 'PIX Key' },
@@ -346,6 +359,11 @@ jest.mock('@/components/Global/AmountInput', () => ({
 jest.mock('@/components/Global/PeanutLoading', () => ({
     __esModule: true,
     default: (props: any) => <div data-testid="peanut-loading">{props.message && <span>{props.message}</span>}</div>,
+}))
+
+jest.mock('@/components/Global/PeanutLoading/CyclingLoading', () => ({
+    __esModule: true,
+    default: () => <div data-testid="cycling-loading" />,
 }))
 
 jest.mock('@/components/Global/NavHeader', () => ({
@@ -567,6 +585,14 @@ jest.mock('@/components/AddMoney/hooks/useCryptoDepositPolling', () => ({
     useCryptoDepositPolling: (...args: any[]) => mockUseCryptoDepositPolling(...args),
 }))
 
+// updateUserById — the offramp handle gate persists the migrant's offramp.xyz
+// username/email through this server action
+const mockUpdateUserById = jest.fn()
+jest.mock('@/app/actions/users', () => ({
+    ...jest.requireActual('@/app/actions/users'),
+    updateUserById: (...args: any[]) => mockUpdateUserById(...args),
+}))
+
 // Country list
 jest.mock('@/components/Common/CountryList', () => ({
     CountryList: (props: any) => (
@@ -599,6 +625,14 @@ jest.mock('@/components/AddWithdraw/AddWithdrawCountriesList', () => ({
 jest.mock('@/components/AddMoney/components/MantecaAddMoney', () => ({
     __esModule: true,
     default: () => <div data-testid="manteca-add-money">Manteca Add Money</div>,
+}))
+
+// MantecaTransfersMaintenanceView — the outage screen shown when a currency is
+// in disabledMantecaCurrencies. Mocked to a testid so GROUP 7 can assert which
+// branch the regional-method route renders without pulling the real Card tree.
+jest.mock('@/components/Global/Banner/MantecaTransfersMaintenanceView', () => ({
+    __esModule: true,
+    MantecaTransfersMaintenanceView: () => <div data-testid="manteca-transfers-maintenance">Manteca Maintenance</div>,
 }))
 
 // AddMoneyBankDetails (for US bank page and bank details step)
@@ -656,10 +690,6 @@ jest.mock('@/components/Slider', () => ({
 
 // Consts for AddMoney
 jest.mock('@/components/AddMoney/consts', () => ({
-    MantecaSupportedExchanges: {
-        AR: 'ARGENTINA',
-        BR: 'BRAZIL',
-    },
     countryData: [
         { type: 'country', id: 'AR', path: 'argentina', currency: 'ARS', iso3: 'ARG' },
         { type: 'country', id: 'BR', path: 'brazil', currency: 'BRL', iso3: 'BRA' },
@@ -670,6 +700,7 @@ jest.mock('@/components/AddMoney/consts', () => ({
         { type: 'country', id: 'XX', path: 'unknown', currency: 'USD', iso3: 'XXX' },
     ],
     ALL_COUNTRIES_ALPHA3_TO_ALPHA2: { ARG: 'AR', BRA: 'BR', USA: 'US', DEU: 'DE', MEX: 'MX', GBR: 'GB' },
+    BRIDGE_ALPHA3_TO_ALPHA2: { USA: 'US', DEU: 'DE', MEX: 'MX', GBR: 'GB' },
 }))
 
 jest.mock('@/components/TransactionDetails/transactionTransformer', () => ({}))
@@ -702,6 +733,7 @@ import OnrampBankPage from '../[country]/bank/page'
 import AddMoneyRegionalMethodPage from '../[country]/[regional-method]/page'
 import AddMoneyCountryPage from '../[country]/page'
 import CryptoDepositView from '@/components/AddMoney/views/CryptoDeposit.view'
+import underMaintenanceConfig from '@/config/underMaintenance.config'
 
 // ---------- helpers ----------
 
@@ -716,6 +748,136 @@ function setParams(params: Record<string, string>) {
     Object.keys(mockParams).forEach((k) => delete mockParams[k])
     Object.entries(params).forEach(([k, v]) => {
         mockParams[k] = v
+    })
+}
+
+// Build the minimal capability fixture that maps to a specific GateState kind,
+// then push it onto the useCapabilities mock. The page reads `gateFor(...)`,
+// so the mock returns a stub gateFor closing over the desired state; it also
+// exposes `bankRails()` for the few sites that read it directly.
+type Gate =
+    | 'ready'
+    | 'accept-tos'
+    | 'fixable-rejection'
+    | 'blocked-rejection'
+    | 'needs-identity'
+    | 'needs-enrollment'
+    | 'waiting-on-provider'
+
+function setGate(kind: Gate) {
+    let rails: any[] = []
+    let nextActions: any[] = []
+    let isKycApproved = false
+    let gateState: any = { kind: 'loading' }
+
+    switch (kind) {
+        case 'ready':
+            rails = [
+                {
+                    id: 'bridge.ach_us',
+                    provider: 'bridge',
+                    method: 'ACH_US',
+                    country: 'US',
+                    currency: 'USD',
+                    status: 'enabled',
+                },
+            ]
+            isKycApproved = true
+            gateState = { kind: 'ready' }
+            break
+        case 'accept-tos':
+            rails = [
+                {
+                    id: 'bridge.ach_us',
+                    provider: 'bridge',
+                    method: 'ACH_US',
+                    country: 'US',
+                    currency: 'USD',
+                    status: 'requires-info',
+                    blockingActions: ['accept-tos'],
+                },
+            ]
+            nextActions = [{ key: 'accept-tos', kind: 'accept-tos', purpose: 'unlock-bridge' }]
+            gateState = { kind: 'accept-tos', userMessage: null }
+            break
+        case 'fixable-rejection':
+            rails = [
+                {
+                    id: 'bridge.ach_us',
+                    provider: 'bridge',
+                    method: 'ACH_US',
+                    country: 'US',
+                    currency: 'USD',
+                    status: 'requires-info',
+                    blockingActions: ['bridge-rfi'],
+                    reason: { code: 'document_rejected', userMessage: 'upload a clearer photo' },
+                },
+            ]
+            nextActions = [{ key: 'bridge-rfi', kind: 'sumsub', purpose: 'unlock-bridge', levelKey: 'rfi' }]
+            gateState = { kind: 'fixable-rejection', userMessage: 'upload a clearer photo' }
+            break
+        case 'blocked-rejection':
+            rails = [
+                {
+                    id: 'bridge.ach_us',
+                    provider: 'bridge',
+                    method: 'ACH_US',
+                    country: 'US',
+                    currency: 'USD',
+                    status: 'blocked',
+                    reason: { code: 'final', userMessage: 'contact support' },
+                },
+            ]
+            gateState = { kind: 'blocked-rejection', userMessage: 'contact support' }
+            break
+        case 'needs-enrollment':
+            // identity verified, no bank rail in scope yet (card-only / pool-tier example)
+            rails = [
+                {
+                    id: 'rain.card',
+                    provider: 'rain',
+                    method: 'CARD',
+                    country: 'GLOBAL',
+                    currency: 'USD',
+                    status: 'enabled',
+                },
+            ]
+            isKycApproved = true
+            gateState = { kind: 'needs-enrollment' }
+            break
+        case 'needs-identity':
+            rails = []
+            gateState = { kind: 'needs-identity' }
+            break
+        case 'waiting-on-provider':
+            // provider reviewing submitted info (e.g. eea-uplift docs) — user
+            // has nothing to do but wait
+            rails = [
+                {
+                    id: 'bridge.ach_us',
+                    provider: 'bridge',
+                    method: 'ACH_US',
+                    country: 'US',
+                    currency: 'USD',
+                    status: 'requires-info',
+                    blockingActions: ['wait:bridge'],
+                },
+            ]
+            gateState = { kind: 'waiting-on-provider', reason: { code: 'bridge_processing' } }
+            break
+    }
+
+    mockUseCapabilities.mockReturnValue({
+        rails,
+        nextActions,
+        isKycApproved,
+        gateFor: () => gateState,
+        bankRails: () =>
+            rails.filter((r) =>
+                ['ACH_US', 'SEPA_EU', 'PIX_BR', 'BANK_TRANSFER_AR', 'SPEI_MX', 'FASTER_PAYMENTS_GB'].includes(r.method)
+            ),
+        canDo: () => false,
+        channelOf: () => null,
     })
 }
 
@@ -751,6 +913,9 @@ function applyDefaults() {
         isUserMantecaKycApproved: true,
     })
 
+    // default: Bridge gate ready (enabled rail). Per-test override via setGate().
+    setGate('ready')
+
     mockUseCurrency.mockReturnValue({
         isLoading: false,
         symbol: 'ARS',
@@ -765,7 +930,6 @@ function applyDefaults() {
     mockUseCreateOnramp.mockReturnValue({
         createOnramp: jest.fn(),
         isLoading: false,
-        error: null,
     })
 
     mockUseLimitsValidation.mockReturnValue({
@@ -784,7 +948,7 @@ function applyDefaults() {
         isLoading: false,
     })
 
-    mockUseBridgeTosGuard.mockReturnValue({
+    mockUseTosGuard.mockReturnValue({
         guardWithTos: jest.fn(() => false),
         showBridgeTos: false,
         hideTos: jest.fn(),
@@ -943,7 +1107,7 @@ describe('GROUP 3: Crypto Deposit', () => {
         expect(screen.getByText('10,000 USD')).toBeInTheDocument()
     })
 
-    test('deposit processing shows PeanutLoading with message', () => {
+    test('deposit processing shows CyclingLoading', () => {
         mockUseCryptoDepositPolling.mockReturnValue({
             status: 'loading',
             resetStatus: jest.fn(),
@@ -965,8 +1129,7 @@ describe('GROUP 3: Crypto Deposit', () => {
             />
         )
 
-        expect(screen.getByTestId('peanut-loading')).toBeInTheDocument()
-        expect(screen.getByText('Almost there! Processing...')).toBeInTheDocument()
+        expect(screen.getByTestId('cycling-loading')).toBeInTheDocument()
     })
 
     test('deposit failed shows error card with retry button', () => {
@@ -1074,13 +1237,93 @@ describe('GROUP 4: Crypto Page (with success)', () => {
 })
 
 // ============================================================
+// GROUP 4b: Offramp migration — required handle gate
+// ============================================================
+describe('GROUP 4b: Offramp migration handle gate', () => {
+    const authWithHandle = (offrampHandle: string | null) => {
+        mockUseAuth.mockReturnValue({
+            user: { user: { username: 'test-user', userId: 'user-123', offrampHandle } },
+            isFetchingUser: false,
+            fetchUser: jest.fn().mockResolvedValue(null),
+        })
+    }
+
+    beforeEach(() => {
+        resetQueryState({ network: 'EVM', source: 'offramp' })
+        mockUseCryptoDepositPolling.mockReturnValue({
+            status: 'not_started',
+            resetStatus: jest.fn(),
+            isResetting: false,
+        })
+        mockRhinoApi.createDepositAddress.mockResolvedValue({
+            depositAddress: '0xDepositAddress123',
+            minDepositLimitUsd: 5,
+            maxDepositLimitUsd: 10000,
+        })
+    })
+
+    test('migrant without a stored handle must enter it before seeing the deposit address', () => {
+        authWithHandle(null)
+        renderWithProviders(<AddMoneyCryptoPage />)
+
+        expect(screen.getByPlaceholderText('Offramp username or email')).toBeInTheDocument()
+        expect(screen.queryByTestId('qr-code')).not.toBeInTheDocument()
+    })
+
+    test('submitting the handle saves it trimmed and reveals the deposit screen', async () => {
+        authWithHandle(null)
+        mockUpdateUserById.mockResolvedValue({ data: {} })
+        renderWithProviders(<AddMoneyCryptoPage />)
+
+        fireEvent.change(screen.getByPlaceholderText('Offramp username or email'), {
+            target: { value: '  alice@offramp.xyz  ' },
+        })
+        fireEvent.click(screen.getByText('Continue'))
+
+        await waitFor(() => {
+            expect(mockUpdateUserById).toHaveBeenCalledWith({
+                userId: 'user-123',
+                offrampHandle: 'alice@offramp.xyz',
+            })
+        })
+        await waitFor(() => {
+            expect(screen.queryByPlaceholderText('Offramp username or email')).not.toBeInTheDocument()
+        })
+    })
+
+    test('save failure keeps the gate up and shows an error', async () => {
+        authWithHandle(null)
+        mockUpdateUserById.mockResolvedValue({ error: 'boom' })
+        renderWithProviders(<AddMoneyCryptoPage />)
+
+        fireEvent.change(screen.getByPlaceholderText('Offramp username or email'), {
+            target: { value: 'alice@offramp.xyz' },
+        })
+        fireEvent.click(screen.getByText('Continue'))
+
+        await waitFor(() => {
+            expect(screen.getByText(/Could not save your Offramp account/)).toBeInTheDocument()
+        })
+        expect(screen.getByPlaceholderText('Offramp username or email')).toBeInTheDocument()
+    })
+
+    test('migrant with a stored handle goes straight to the deposit screen', () => {
+        authWithHandle('alice@offramp.xyz')
+        renderWithProviders(<AddMoneyCryptoPage />)
+
+        expect(screen.queryByPlaceholderText('Offramp username or email')).not.toBeInTheDocument()
+        expect(screen.getAllByText('Migrate from Offramp').length).toBeGreaterThan(0)
+    })
+})
+
+// ============================================================
 // GROUP 5: Bridge Bank Onramp (SEPA / US / UK / MX)
 // ============================================================
 describe('GROUP 5: Bridge Bank Onramp', () => {
     beforeEach(() => {
         setParams({ country: 'germany' })
         resetQueryState({ step: 'inputAmount', amount: '' })
-        mockGate.mockReturnValue({ type: 'ready' })
+        setGate('ready')
     })
 
     test('inputAmount step shows amount input and Continue button', () => {
@@ -1106,12 +1349,12 @@ describe('GROUP 5: Bridge Bank Onramp', () => {
         expect(screen.getByText('Country not found')).toBeInTheDocument()
     })
 
-    test('user not KYC approved shows InitiateKycModal on Continue', async () => {
+    test('fresh user needs KYC before Bridge deposit confirmation', async () => {
         mockUseKycStatus.mockReturnValue({
             isUserKycApproved: false,
             isUserMantecaKycApproved: false,
         })
-        mockGate.mockReturnValue({ type: 'needs_enrollment' })
+        setGate('needs-identity')
         resetQueryState({ step: 'inputAmount', amount: '100' })
 
         renderWithProviders(<OnrampBankPage />)
@@ -1154,7 +1397,6 @@ describe('GROUP 5: Bridge Bank Onramp', () => {
         mockUseCreateOnramp.mockReturnValue({
             createOnramp: mockCreateOnramp,
             isLoading: false,
-            error: null,
         })
         resetQueryState({ step: 'inputAmount', amount: '100' })
 
@@ -1176,10 +1418,11 @@ describe('GROUP 5: Bridge Bank Onramp', () => {
 
     test('onramp error displays ErrorAlert', async () => {
         const mockCreateOnramp = jest.fn().mockRejectedValue(new Error('Service unavailable'))
+        // the page must surface the caught error's message directly — the hook
+        // exposes no error state to read (that channel was the stale-closure trap).
         mockUseCreateOnramp.mockReturnValue({
             createOnramp: mockCreateOnramp,
             isLoading: false,
-            error: 'Service unavailable',
         })
         resetQueryState({ step: 'inputAmount', amount: '100' })
 
@@ -1195,8 +1438,31 @@ describe('GROUP 5: Bridge Bank Onramp', () => {
             fireEvent.click(screen.getByTestId('confirm-onramp'))
         })
 
-        // After error, the setError should have been called
-        expect(mockOnrampFlow.setError).toHaveBeenCalled()
+        // the caught message must be shown to the user
+        expect(mockOnrampFlow.setError).toHaveBeenCalledWith({
+            showError: true,
+            errorMessage: 'Service unavailable',
+        })
+    })
+
+    test('waiting-on-provider gate shows the reverification pending modal instead of a dead button', async () => {
+        setGate('waiting-on-provider')
+        const mockCreateOnramp = jest.fn()
+        mockUseCreateOnramp.mockReturnValue({
+            createOnramp: mockCreateOnramp,
+            isLoading: false,
+        })
+        resetQueryState({ step: 'inputAmount', amount: '100' })
+
+        renderWithProviders(<OnrampBankPage />)
+
+        await act(async () => {
+            fireEvent.click(screen.getByText('Continue'))
+        })
+
+        // no doomed transfer attempt; the user sees the bridge-review pending modal
+        expect(mockCreateOnramp).not.toHaveBeenCalled()
+        expect(await screen.findByText(/reviewing your details/i)).toBeInTheDocument()
     })
 
     test('limits blocking disables Continue and shows LimitsWarningCard', () => {
@@ -1245,8 +1511,8 @@ describe('GROUP 5: Bridge Bank Onramp', () => {
     })
 
     test('Bridge TOS guard shows TOS step', async () => {
-        mockGate.mockReturnValue({ type: 'accept_tos' })
-        mockUseBridgeTosGuard.mockReturnValue({
+        setGate('accept-tos')
+        mockUseTosGuard.mockReturnValue({
             guardWithTos: jest.fn(() => true),
             showBridgeTos: true,
             hideTos: jest.fn(),
@@ -1289,11 +1555,26 @@ describe('GROUP 6: US Bank Page', () => {
 // GROUP 7: Manteca Deposit (AR, BR)
 // ============================================================
 describe('GROUP 7: Manteca Deposit (Regional Method)', () => {
-    test('AR + manteca renders MantecaAddMoney', () => {
+    afterEach(() => {
+        // reset the per-currency outage list so its default value can't leak between tests
+        underMaintenanceConfig.disabledMantecaCurrencies = []
+    })
+
+    test('AR + manteca renders MantecaAddMoney when its currency (ARS) is live', () => {
+        underMaintenanceConfig.disabledMantecaCurrencies = ['BRL'] // BRL down, ARS live
         setParams({ country: 'argentina', 'regional-method': 'manteca' })
         renderWithProviders(<AddMoneyRegionalMethodPage />)
 
         expect(screen.getByTestId('manteca-add-money')).toBeInTheDocument()
+    })
+
+    test('AR + manteca shows the outage screen when ARS is in the disabled list', () => {
+        underMaintenanceConfig.disabledMantecaCurrencies = ['ARS']
+        setParams({ country: 'argentina', 'regional-method': 'manteca' })
+        renderWithProviders(<AddMoneyRegionalMethodPage />)
+
+        expect(screen.getByTestId('manteca-transfers-maintenance')).toBeInTheDocument()
+        expect(screen.queryByTestId('manteca-add-money')).not.toBeInTheDocument()
     })
 
     test('unsupported country + manteca renders nothing', () => {
@@ -1377,6 +1658,27 @@ describe('GROUP 8: InputAmountStep Component', () => {
             />
         )
 
+        expect(screen.getByText('Continue')).not.toBeDisabled()
+    })
+
+    test('renders maintenanceBanner and keeps Continue enabled (warn-only)', () => {
+        renderWithProviders(
+            <InputAmountStep
+                tokenAmount="100"
+                setTokenAmount={jest.fn()}
+                onSubmit={jest.fn()}
+                isLoading={false}
+                error={null}
+                setCurrencyAmount={jest.fn()}
+                limitsValidation={{ isBlocking: false, isWarning: false, currency: 'USD' }}
+                limitsCurrency="USD"
+                onBack={jest.fn()}
+                maintenanceBanner={<div data-testid="pix-maintenance">PIX deposits are under maintenance</div>}
+            />
+        )
+
+        expect(screen.getByTestId('pix-maintenance')).toBeInTheDocument()
+        // warn-only: the banner is informational and must not block submission
         expect(screen.getByText('Continue')).not.toBeDisabled()
     })
 
@@ -1484,6 +1786,33 @@ describe('GROUP 8: InputAmountStep Component', () => {
         )
 
         expect(screen.getByTestId('peanut-loading')).toBeInTheDocument()
+    })
+
+    // Regression for PEANUT-UI-PS7: a failed FX fetch leaves price=null while
+    // isLoading=false. The old `currencyData.price!.buy` derefed null and crashed
+    // the whole render (Next.js page crash). It must now render an error and
+    // disable Continue instead of throwing.
+    test('rate fetch failure renders error and disables Continue (no crash)', () => {
+        renderWithProviders(
+            <InputAmountStep
+                tokenAmount="100"
+                setTokenAmount={jest.fn()}
+                onSubmit={jest.fn()}
+                isLoading={false}
+                error={null}
+                setCurrencyAmount={jest.fn()}
+                currencyData={{ isLoading: false, isError: true, symbol: null, price: null }}
+                limitsValidation={{ isBlocking: false, isWarning: false, currency: 'USD' }}
+                limitsCurrency="USD"
+                onBack={jest.fn()}
+            />
+        )
+
+        expect(screen.getByTestId('error-alert')).toBeInTheDocument()
+        expect(
+            screen.getByText('Exchange rates are temporarily unavailable. Please try again in a moment.')
+        ).toBeInTheDocument()
+        expect(screen.getByText('Continue')).toBeDisabled()
     })
 
     test('onSubmit called when Continue clicked', async () => {

@@ -14,7 +14,9 @@ import { ANALYTICS_EVENTS } from '@/constants/analytics.consts'
 import { BASE_URL } from '@/constants/general.consts'
 import { serverFetch } from '@/utils/api-fetch'
 import { openExternalUrl } from '@/utils/capacitor'
-import { pixKeyToBRCode } from '@/utils/pix.utils'
+import { pixKeyToQrPayUrl } from '@/utils/pix.utils'
+import { extractPaymentValue } from '@/utils/clipboard-extract.utils'
+import { recipientPayUrl, qrClaimUrl } from '@/utils/native-routes'
 import * as Sentry from '@sentry/nextjs'
 import { usePathname, useRouter, useSearchParams } from 'next/navigation'
 import posthog from 'posthog-js'
@@ -27,6 +29,7 @@ enum EModalType {
     DIRECT_SEND = 'DIRECT_SEND',
     EXTERNAL_URL = 'EXTERNAL_URL',
     UNRECOGNIZED = 'UNRECOGNIZED',
+    PIX_RECURRING = 'PIX_RECURRING',
 }
 
 interface ModalContentProps {
@@ -150,8 +153,23 @@ function UnrecognizedContent({ setIsModalOpen }: ModalContentProps) {
     )
 }
 
+function PixRecurringContent({ setIsModalOpen }: ModalContentProps) {
+    return (
+        <div className="flex flex-col justify-center p-6">
+            <span className="text-sm">This QR code is for a recurring payment (PIX Automático).</span>
+            <span className="text-sm">
+                Peanut doesn't support recurring PIX payments — please ask for a regular PIX QR code instead.
+            </span>
+            <Button onClick={() => setIsModalOpen(false)} className="mt-4 w-full" shadowType="primary" shadowSize="4">
+                Okay
+            </Button>
+        </div>
+    )
+}
+
 function getModalTitle(modalContent: EModalType | undefined, qrType: EQrType | undefined): string | undefined {
     if (modalContent === EModalType.UNRECOGNIZED) return 'Unrecognized QR code'
+    if (modalContent === EModalType.PIX_RECURRING) return 'PIX Automático not supported'
     if (!modalContent || !qrType) return undefined
     switch (modalContent) {
         case EModalType.QR_NOT_SUPPORTED:
@@ -171,6 +189,7 @@ const MODAL_CONTENTS: Record<EModalType, React.ComponentType<ModalContentProps>>
     [EModalType.DIRECT_SEND]: DirectSendContent,
     [EModalType.EXTERNAL_URL]: ExternalUrlContent,
     [EModalType.UNRECOGNIZED]: UnrecognizedContent,
+    [EModalType.PIX_RECURRING]: PixRecurringContent,
 }
 
 export default function QRScannerOverlay() {
@@ -218,6 +237,14 @@ export default function QRScannerOverlay() {
         }
         posthog.capture(ANALYTICS_EVENTS.QR_SCANNED, { qr_type: recognized, data: getLogData() })
         if (!recognized) {
+            // Pasted text is often prose with an address embedded ("...0xabc... is
+            // the Arbitrum address..."). Pull a valid EVM address out and re-process
+            // it as a clean value before giving up. One level of recursion only —
+            // the extracted value is a bare address, which recognizeQr matches.
+            const embeddedAddress = extractPaymentValue(data, 'evmAddress')
+            if (embeddedAddress && embeddedAddress.toLowerCase() !== normalized) {
+                return processQRCode(embeddedAddress)
+            }
             showModal(EModalType.UNRECOGNIZED)
             return { success: true }
         }
@@ -243,11 +270,11 @@ export default function QRScannerOverlay() {
                             if (lookup.claimed && lookup.redirectUrl) {
                                 redirectUrl = lookup.redirectUrl
                             } else {
-                                redirectUrl = `/qr/${redirectQrCode}`
+                                redirectUrl = qrClaimUrl(redirectQrCode)
                             }
                         } catch (error) {
                             console.error('Error checking redirect QR:', error)
-                            redirectUrl = `/qr/${redirectQrCode}`
+                            redirectUrl = qrClaimUrl(redirectQrCode)
                         }
                     } else {
                         redirectUrl = path
@@ -256,24 +283,28 @@ export default function QRScannerOverlay() {
                 break
             case EQrType.EVM_ADDRESS:
                 {
-                    toConfirmUrl = `/${normalized}`
+                    // recipientPayUrl → web: /<addr> ([...recipient]); native: /send?recipient=<addr>
+                    toConfirmUrl = recipientPayUrl(normalized)
                 }
                 break
             case EQrType.EIP_681:
                 {
                     try {
                         const { address, chainId, amount, tokenSymbol } = parseEip681(normalized)
-                        toConfirmUrl = `/${address}`
+                        // build the recipient PATH (no leading slash), then route it
+                        // through recipientPayUrl for native query-param compatibility.
+                        let path = address
                         if (chainId) {
-                            toConfirmUrl += `@${chainId}`
+                            path += `@${chainId}`
                             if (tokenSymbol) {
-                                toConfirmUrl += `/`
+                                path += `/`
                                 if (amount) {
-                                    toConfirmUrl += `${amount}`
+                                    path += `${amount}`
                                 }
-                                toConfirmUrl += `${tokenSymbol}`
+                                path += `${tokenSymbol}`
                             }
                         }
+                        toConfirmUrl = recipientPayUrl(path)
                     } catch (error) {
                         toast.error('Error parsing EIP-681 URL')
                         Sentry.captureException(error)
@@ -283,7 +314,7 @@ export default function QRScannerOverlay() {
             case EQrType.ENS_NAME: {
                 const resolvedAddress = await resolveEns(normalized)
                 if (resolvedAddress) {
-                    toConfirmUrl = `/${normalized}`
+                    toConfirmUrl = recipientPayUrl(normalized)
                 } else {
                     showModal(EModalType.UNRECOGNIZED)
                     return { success: true }
@@ -300,16 +331,19 @@ export default function QRScannerOverlay() {
                 break
             case EQrType.PIX_KEY:
                 {
-                    const brCode = pixKeyToBRCode(data)
-                    if (brCode) {
-                        const timestamp = Date.now()
-                        redirectUrl = `/qr-pay?qrCode=${encodeURIComponent(brCode)}&t=${timestamp}&type=${EQrType.PIX}`
+                    const url = pixKeyToQrPayUrl(data)
+                    if (url) {
+                        redirectUrl = url
                     } else {
                         showModal(EModalType.UNRECOGNIZED)
                         return { success: true }
                     }
                 }
                 break
+            case EQrType.PIX_RECURRING: {
+                showModal(EModalType.PIX_RECURRING)
+                return { success: true }
+            }
             case EQrType.BITCOIN_ONCHAIN:
             case EQrType.BITCOIN_INVOICE:
             case EQrType.TRON_ADDRESS:

@@ -1,22 +1,21 @@
 'use client'
 import { type FC, useCallback, useEffect, useRef, useState } from 'react'
-import { useRouter } from 'next/navigation'
-import { isCapacitor } from '@/utils/capacitor'
-import { chargePayUrl } from '@/utils/native-routes'
-import { useQueryStates, parseAsStringEnum } from 'nuqs'
+import { notFound } from 'next/navigation'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import posthog from 'posthog-js'
 import { ANALYTICS_EVENTS } from '@/constants/analytics.consts'
 import { cardApi, type CardInfoResponse } from '@/services/card'
 import { useAuth } from '@/context/authContext'
 import { RAIN_CARD_OVERVIEW_QUERY_KEY, useRainCardOverview } from '@/hooks/useRainCardOverview'
-import underMaintenanceConfig from '@/config/underMaintenance.config'
 import { computeCardState, findActiveCard, type CardTopLevelState } from '@/components/Card/cardState.utils'
-import { pollUntilApplyAdvances } from '@/components/Card/cardApply.utils'
-import CardPioneerFlow from '@/components/Card/CardPioneerFlow'
+import { pollUntilApplyAdvances, pollUntilReady } from '@/components/Card/cardApply.utils'
 import AddCardEntryScreen from '@/components/Card/AddCardEntryScreen'
 import ApplicationStatusScreen from '@/components/Card/ApplicationStatusScreen'
 import CardTermsScreen from '@/components/Card/CardTermsScreen'
+import CardCountryConfirmScreen from '@/components/Card/CardCountryConfirmScreen'
+import CardRejectionScreen from '@/components/Card/CardRejectionScreen'
+import BadgeSkipCelebration from '@/components/Card/BadgeSkipCelebration'
+import CardEligibilityCheckScreen from '@/components/Card/CardEligibilityCheckScreen'
 import YourCardScreen from '@/components/Card/YourCardScreen'
 import Loading from '@/components/Global/Loading'
 import { Button } from '@/components/0_Bruddle/Button'
@@ -24,13 +23,36 @@ import PageContainer from '@/components/0_Bruddle/PageContainer'
 import { SumsubKycWrapper } from '@/components/Kyc/SumsubKycWrapper'
 import { rainApi, type ApplyForCardResponse } from '@/services/rain'
 import { useGrantSessionKey } from '@/hooks/wallet/useGrantSessionKey'
+import { useCapabilities } from '@/hooks/useCapabilities'
 import { useModalsContext } from '@/context/ModalsContext'
 import { useSafeBack } from '@/hooks/useSafeBack'
 
+// localStorage key for the one-time celebration gate (per-device by design:
+// re-doing the funnel re-celebrates, see the eligibility-check effect below).
+// v2 (2026-05-25): celebration now fires for ALL hasCardAccess users, not
+// just skip-badge holders. v1's stale `true` values from earlier QA runs
+// would silently skip the celebration — bumping the key invalidates them.
+const SKIP_CELEBRATION_SEEN_KEY = 'card_skip_celebration_seen_v2'
+
+function getSkipCelebrationSeen(): boolean {
+    if (typeof window === 'undefined') return false
+    return window.localStorage.getItem(SKIP_CELEBRATION_SEEN_KEY) === 'true'
+}
+
+function markSkipCelebrationSeen(): void {
+    if (typeof window === 'undefined') return
+    window.localStorage.setItem(SKIP_CELEBRATION_SEEN_KEY, 'true')
+}
+
+// Eligibility-check screen lifetime per Hugo's spec: gate fires every
+// /card mount UNTIL the user has an issued card. Persisting across mount
+// would skip the moment on revisit — wrong. Within a single mount, once
+// the user releases the hold, the in-React state below stays true so
+// they don't re-see the gate after celebration / add-card transitions.
+
 const CardPage: FC = () => {
-    const router = useRouter()
     const queryClient = useQueryClient()
-    const { user } = useAuth()
+    const { user, fetchUser } = useAuth()
     const userId = user?.user?.userId
 
     const {
@@ -47,6 +69,7 @@ const CardPage: FC = () => {
 
     const { overview, isLoading: overviewLoading, error: overviewError } = useRainCardOverview()
     const { serializeGrant } = useGrantSessionKey()
+    const { railsForProvider, isLoading: capabilitiesLoading } = useCapabilities()
     const { setIsSupportModalOpen } = useModalsContext()
     const onBack = useSafeBack('/home')
 
@@ -57,30 +80,72 @@ const CardPage: FC = () => {
     // When backend returns status:'terms-required', we capture it here so
     // the dispatcher can render the terms screen between Sumsub and submit.
     const [pendingTerms, setPendingTerms] = useState<{ isUsResident: boolean } | null>(null)
+    // When backend returns status:'country-confirmation-required' (Sumsub
+    // address country contradicts the ID-document country), we capture the
+    // candidate list here so the dispatcher can render the residence
+    // confirmation screen before terms.
+    const [pendingCountryConfirmation, setPendingCountryConfirmation] = useState<{ candidates: string[] } | null>(null)
     // Covers the moment between "terms accepted" and "overview refetched with
     // the new card row". Without it the screen would briefly flip back to Add
     // Card mid-apply before the state machine sees the new state.
     const [isIssuing, setIsIssuing] = useState(false)
 
-    // Maintenance gate: redirect non-access users away during a Pioneer
-    // outage, but let users with hasCardAccess (manual grant or completed
-    // purchase) keep reaching their card. Wait for cardInfo so we don't
-    // bounce them before we know their access state — and bail on fetch
-    // error so the retry UI below stays reachable instead of redirecting
-    // a granted user mid-blip.
+    // Track whether the user has acknowledged the skip-badge celebration.
+    // localStorage on purpose (per-device, replayable via the eligibility
+    // re-hold below) — the celebration is a moment, not durable state.
+    const [skipCelebrationSeen, setSkipCelebrationSeen] = useState<boolean>(() => getSkipCelebrationSeen())
+
+    // Press-and-hold "see if you qualify" gate. Resets per mount: as long
+    // as the user has not been issued a card, every fresh /card visit
+    // re-shows the gate. Within the same mount, this stays true after they
+    // release the hold so they don't get pulled back from celebration /
+    // add-card. State machine ALSO skips the gate when an issued card
+    // exists (see cardState.utils.ts — active-card wins first).
+    const [eligibilityCheckDone, setEligibilityCheckDone] = useState<boolean>(false)
+
+    // The old `?press_door=1` auto-stamp was removed alongside the /shhhhh
+    // door rework: the bare door joins the waitlist and grants nothing, so a
+    // shareable URL that silently stamps flowEarlyAccess would have been the
+    // exact bypass the rework forbids. BE now also reports flowEarlyAccess
+    // true whenever hasCardAccess is (inner gate implies outer).
+
+    // Outer gate: pre-public-launch, the card campaign isn't fully online
+    // yet. Users without flow early access get a 404 — the page behaves as
+    // if it doesn't exist. The only ways in are (a) already holding a card
+    // / being mid-application, or (b) holding card access (skip badge /
+    // admin grant — BE reports flowEarlyAccess true whenever hasCardAccess
+    // is). Everyone else belongs on /shhhhh, which joins the waitlist
+    // inline and never routes here.
+    //
+    // IMPORTANT: skip the 404 if the user already has a non-canceled card.
+    // Legacy Pioneers + admin-granted users issued cards before /shhhhh
+    // existed and have no flowEarlyAccess stamp — they must still reach
+    // YourCardScreen. The computeCardState() precedence below mirrors this
+    // rule (active-card before no-flow-access).
+    //
+    // notFound() thrown synchronously inside the effect bubbles to Next's
+    // not-found boundary just like a render-time call.
     useEffect(() => {
-        if (!underMaintenanceConfig.disableCardPioneers) return
-        if (pioneerLoading) return
-        if (pioneerError) return
-        if (cardInfo?.hasCardAccess) return
-        router.replace('/home')
-    }, [router, pioneerLoading, pioneerError, cardInfo?.hasCardAccess])
+        if (pioneerLoading || pioneerError) return
+        if (!cardInfo) return
+        if (cardInfo.flowEarlyAccess) return
+        // CR FE#1: wait for overview before checking issued cards — otherwise
+        // legacy card-holders (overview still loading) get incorrectly 404'd
+        // because `overview?.cards.some(...)` returns false on undefined input.
+        if (overviewLoading || !overview) return
+        const hasIssuedCard = overview.cards.some((c) => c.status !== 'CANCELED')
+        if (hasIssuedCard) return
+        posthog.capture(ANALYTICS_EVENTS.CARD_FLOW_GATED)
+        notFound()
+    }, [pioneerLoading, pioneerError, cardInfo, overview, overviewLoading])
 
     const state = computeCardState({
         overview,
-        pioneerInfo: cardInfo,
+        cardInfo,
         overviewLoading,
-        pioneerLoading,
+        cardInfoLoading: pioneerLoading,
+        skipCelebrationSeen,
+        eligibilityCheckDone,
     })
 
     // Fire CARD_STATE_VIEWED on each distinct top-level state entry. Skip the
@@ -95,6 +160,53 @@ const CardPage: FC = () => {
         })
         lastReportedStateRef.current = state
     }, [state])
+
+    // Write-only URL mirror for the computed state. Lets you see at a glance
+    // which screen the user is on (?card_state=eligibility-check, etc.) without
+    // making the URL the source of truth — manipulating the param has no
+    // effect on the rendered screen, the server state still wins. Skips
+    // 'loading' to avoid a noisy intermediate value on mount.
+    useEffect(() => {
+        if (typeof window === 'undefined') return
+        if (state === 'loading') return
+        const url = new URL(window.location.href)
+        if (url.searchParams.get('card_state') === state) return
+        url.searchParams.set('card_state', state)
+        window.history.replaceState(window.history.state, '', url.toString())
+    }, [state])
+
+    // Re-doing the funnel = re-celebrating. Every time the user lands on
+    // the eligibility-check screen (a fresh /card visit, no card yet
+    // issued, hold not yet completed), clear any stale celebration-seen
+    // flag so the post-hold transition reliably surfaces the celebration.
+    // The flag is set again when the user dismisses celebration via
+    // "Continue to your card", so it still suppresses a re-trigger on
+    // refresh after dismissal — only a fresh hold re-celebrates.
+    useEffect(() => {
+        if (state !== 'eligibility-check') return
+        if (!skipCelebrationSeen) return
+        if (typeof window !== 'undefined') {
+            window.localStorage.removeItem(SKIP_CELEBRATION_SEEN_KEY)
+        }
+        setSkipCelebrationSeen(false)
+    }, [state, skipCelebrationSeen])
+
+    // Refetch the user profile when entering the celebration so the share
+    // asset reflects the user's CURRENT badge collection. Without this,
+    // badges granted (e.g. via auto-award webhooks or admin cheats) after
+    // the auth context's initial /get-user don't appear on the asset —
+    // user.user.badges stays cached as the login-time snapshot. Fires
+    // once per state entry (ref-guarded) so we don't spam the BE.
+    const celebrationFetchedUserRef = useRef(false)
+    useEffect(() => {
+        if (state !== 'waitlist-skip-celebration') {
+            celebrationFetchedUserRef.current = false
+            return
+        }
+        if (celebrationFetchedUserRef.current) return
+        celebrationFetchedUserRef.current = true
+        void fetchUser()
+    }, [state, fetchUser])
 
     const invalidateOverview = useCallback(() => {
         void queryClient.invalidateQueries({ queryKey: [RAIN_CARD_OVERVIEW_QUERY_KEY] })
@@ -116,15 +228,57 @@ const CardPage: FC = () => {
                 posthog.capture(ANALYTICS_EVENTS.CARD_SUMSUB_OPENED)
                 return
             }
+            // Conflicting residence evidence — collect the user's pick before
+            // anything reaches Rain. Cleared once a later response advances
+            // past it (the answer is persisted server-side).
+            if (res.status === 'country-confirmation-required' && 'candidates' in res) {
+                setPendingTerms(null)
+                setPendingCountryConfirmation({ candidates: res.candidates })
+                return
+            }
             if (res.status === 'terms-required' && 'isUsResident' in res) {
+                setPendingCountryConfirmation(null)
                 setPendingTerms({ isUsResident: res.isUsResident })
                 return
             }
             // pending / already-applied → state machine routes based on overview.
             setPendingTerms(null)
+            setPendingCountryConfirmation(null)
             invalidateOverview()
         },
         [invalidateOverview]
+    )
+
+    // The user picked their residence country on the confirmation screen.
+    // Re-apply with the pick — the backend validates it against its own
+    // candidate recompute, repairs the Sumsub data, and usually answers
+    // `terms-required` next.
+    const handleConfirmCountry = useCallback(
+        async (countryCode: string) => {
+            setApplyError(null)
+            posthog.capture(ANALYTICS_EVENTS.CARD_COUNTRY_CONFIRMED, { country: countryCode })
+            try {
+                const res = await rainApi.applyForCard({ confirmedResidenceCountry: countryCode })
+                // Caller-specific `incomplete` branch (advanceFromApplyResponse
+                // deliberately doesn't handle it): the applicant regressed
+                // between the mismatch response and the confirm call — open the
+                // WebSDK instead of silently dumping the user on the entry
+                // screen via the default overview-invalidate arm.
+                if (res.status === 'incomplete' && 'sumsubAccessToken' in res) {
+                    setPendingCountryConfirmation(null)
+                    setSumsubToken(res.sumsubAccessToken)
+                    posthog.capture(ANALYTICS_EVENTS.CARD_SUMSUB_OPENED)
+                    return
+                }
+                advanceFromApplyResponse(res)
+            } catch (e) {
+                const message = e instanceof Error ? e.message : 'Failed to confirm country'
+                console.error('[card apply] country confirm error:', e)
+                setApplyError(message)
+                posthog.capture(ANALYTICS_EVENTS.CARD_APPLY_FAILED, { error_message: message })
+            }
+        },
+        [advanceFromApplyResponse]
     )
 
     const handleApply = useCallback(
@@ -222,10 +376,36 @@ const CardPage: FC = () => {
         pollAbortRef.current = controller
 
         try {
+            // Two-stage poll. First wait for the webhook-stamped readiness flag
+            // (cheap, DB-only, safe at 1s cadence). Once Sumsub has reviewed
+            // rain-requirements GREEN, fall through to the existing apply poll.
+            //
+            // Previous behaviour: single-stage `pollUntilApplyAdvances` against
+            // POST /rain/cards — every iteration hit Sumsub for `moveToLevel` +
+            // `getApplicant` + `getQuestionnaireAnswers`. ~75 Sumsub round-trips
+            // per stuck user, AND the WebSDK got re-opened on every `incomplete`
+            // in the race window, showing the user "verification is taking
+            // longer than expected" (Barbara F-M's 2026-06-02 Crisp escalation).
+            const readyResult = await pollUntilReady({
+                fetchReadiness: () => rainApi.getCardApplyReadiness(),
+                intervalMs: 1000,
+                timeoutMs: 30000,
+                signal: controller.signal,
+            })
+            if (controller.signal.aborted) return
+            if (readyResult === false) {
+                setApplyError('Verification is taking longer than expected. Please try again.')
+                return
+            }
+
+            // Sumsub is GREEN — single apply call should now advance past
+            // `incomplete`. Keep `pollUntilApplyAdvances` as a thin safety net
+            // for the rare case where the webhook flag landed but the
+            // applicant state hasn't fully propagated (e.g. read-replica lag).
             const res = await pollUntilApplyAdvances({
                 fetchApply: () => rainApi.applyForCard({ termsAccepted: false }),
                 intervalMs: 1000,
-                timeoutMs: 15000,
+                timeoutMs: 5000,
                 signal: controller.signal,
             })
             if (controller.signal.aborted) return
@@ -264,13 +444,18 @@ const CardPage: FC = () => {
         setSumsubToken(null)
         if (res.status === 'terms-required' && 'isUsResident' in res) {
             setPendingTerms({ isUsResident: res.isUsResident })
+        } else if (res.status === 'country-confirmation-required' && 'candidates' in res) {
+            setPendingCountryConfirmation({ candidates: res.candidates })
         } else {
             invalidateOverview()
         }
         return ''
     }, [invalidateOverview])
 
-    if (underMaintenanceConfig.disableCardPioneers && !pioneerLoading && !pioneerError && !cardInfo?.hasCardAccess) {
+    // Outer-gate fail — the useEffect above fires notFound() to render the
+    // 404 boundary; render nothing here so the page doesn't flash for the
+    // one frame before that lands.
+    if (state === 'no-flow-access') {
         return null
     }
 
@@ -304,6 +489,24 @@ const CardPage: FC = () => {
         if (isIssuing) {
             return <ApplicationStatusScreen variant="pending" />
         }
+        // Residence confirmation comes before terms in the funnel — the
+        // backend won't return terms-required until the country is resolved.
+        if (pendingCountryConfirmation) {
+            return (
+                <CardCountryConfirmScreen
+                    candidates={pendingCountryConfirmation.candidates}
+                    onConfirm={handleConfirmCountry}
+                    onContactSupport={() => setIsSupportModalOpen(true)}
+                    onPrev={() => {
+                        // Clear the shared error too — a confirm failure must not
+                        // leak onto the entry/terms screens after backing out.
+                        setPendingCountryConfirmation(null)
+                        setApplyError(null)
+                    }}
+                    submitError={applyError}
+                />
+            )
+        }
         // Terms screen takes precedence over the state-machine target — the
         // user already clicked "Get your card" or completed Sumsub; we need
         // to collect consent before letting them back out to Add Card.
@@ -318,27 +521,130 @@ const CardPage: FC = () => {
             )
         }
         switch (state) {
-            case 'pioneer':
-                return <CardPioneerFlow cardInfo={cardInfo!} refetchCardInfo={refetchCardInfo} />
+            case 'eligibility-check':
+                return (
+                    <CardEligibilityCheckScreen
+                        username={user?.user?.username ?? undefined}
+                        onPrev={onBack}
+                        onComplete={() => {
+                            setEligibilityCheckDone(true)
+                            // The state machine re-evaluates on the next render
+                            // and either lands on 'waitlist-skip-celebration' or
+                            // 'waitlist' based on skipBadges. No nav, just a
+                            // state flip — keeps the share-asset reveal feeling
+                            // continuous.
+                        }}
+                    />
+                )
+            case 'waitlist': {
+                // The Berghain-style "not tonight" rejection is the TERMINAL
+                // waitlist screen — a shareable door let-down (tags @joinpeanut)
+                // that doubles as the waitlist-join CTA. Once they join we keep
+                // them here (`alreadyJoined`) so the asset + "Tweet to appeal"
+                // stay grabbable — no separate cooldown screen to dead-end on.
+                return (
+                    <CardRejectionScreen
+                        username={user?.user?.username ?? undefined}
+                        waitlistTotal={cardInfo!.waitlistTotal}
+                        admittedTotal={cardInfo!.admittedTotal}
+                        alreadyJoined={!!cardInfo!.waitlistJoinedAt}
+                        onPrev={onBack}
+                        onJoined={refetchCardInfo}
+                    />
+                )
+            }
+            case 'waitlist-skip-celebration': {
+                // Pick the freshest skip badge for the celebration headline.
+                const skipCode = cardInfo!.skipBadges[0]
+                // Share asset shows ALL earned badges, not just skip-badges.
+                // `user.user.badges` is the full collection from /get-user
+                // (with earnedAt) — fall back to cardInfo.skipBadges if it
+                // hasn't loaded yet so we still render something.
+                const allBadges =
+                    user?.user?.badges?.map((b) => ({
+                        code: b.code,
+                        earnedAt: b.earnedAt,
+                    })) ?? cardInfo!.skipBadges.map((code) => ({ code }))
+                return (
+                    <BadgeSkipCelebration
+                        badgeCode={skipCode}
+                        username={user?.user?.username ?? undefined}
+                        badges={allBadges}
+                        onContinue={() => {
+                            markSkipCelebrationSeen()
+                            setSkipCelebrationSeen(true)
+                            invalidateOverview()
+                            void refetchCardInfo()
+                        }}
+                    />
+                )
+            }
             case 'add-card':
                 return <AddCardEntryScreen onApply={() => handleApply(false)} onPrev={onBack} applyError={applyError} />
             case 'pending':
                 return <ApplicationStatusScreen variant="pending" onPrev={onBack} />
             case 'manual-review':
                 return <ApplicationStatusScreen variant="manual-review" onPrev={onBack} />
-            case 'rejected':
+            case 'requires-info': {
+                // Surface the structured remediation reason from the
+                // capabilities read-model — `rail.reason.userMessage` is
+                // display-ready and provider-neutral by contract. The card
+                // provider serves exactly one rail, so [0] is the card rail.
+                // Overview and capabilities load independently — wait for
+                // capabilities so the screen never flashes without its reason.
+                if (capabilitiesLoading) {
+                    return (
+                        <div className="flex min-h-[inherit] w-full items-center justify-center">
+                            <Loading />
+                        </div>
+                    )
+                }
+                const cardRailReason = railsForProvider('rain')[0]?.reason?.userMessage
+                return (
+                    <ApplicationStatusScreen
+                        variant="requires-info"
+                        reasonMessage={cardRailReason}
+                        onContactSupport={() => setIsSupportModalOpen(true)}
+                        onPrev={onBack}
+                    />
+                )
+            }
+            case 'requires-support':
+                // Pipeline-side failure — nothing the user can re-submit.
+                // Same support deep-link as 'rejected' below.
+                return (
+                    <ApplicationStatusScreen
+                        variant="requires-support"
+                        onContactSupport={() => setIsSupportModalOpen(true)}
+                        onPrev={onBack}
+                    />
+                )
+            case 'rejected': {
                 // No retry CTA: Rain denials are terminal on our side. The
                 // only path forward is support reviewing the case manually
                 // (PEP / sanctions / fraud-pattern flags need a human in the
                 // loop on Rain's end). Open Crisp directly — sending the user
                 // to /support's FAQ first adds a step for no upside.
+                //
+                // Surface the specific, vetted rejection reason from the
+                // capabilities read-model (`rail.reason.userMessage` — e.g.
+                // "Peanut cards aren't available in your state yet."). Render
+                // immediately rather than spinner-gating: unlike requires-info
+                // (meaningless without its reason), the rejected screen is useful
+                // on its own (reassurance + support CTA), so show it now and let
+                // the reason fill in once capabilities resolve.
+                const cardRailReason = capabilitiesLoading
+                    ? undefined
+                    : railsForProvider('rain')[0]?.reason?.userMessage
                 return (
                     <ApplicationStatusScreen
                         variant="rejected"
+                        reasonMessage={cardRailReason}
                         onContactSupport={() => setIsSupportModalOpen(true)}
                         onPrev={onBack}
                     />
                 )
+            }
             case 'active': {
                 const card = findActiveCard(overview)!
                 return <YourCardScreen overview={overview!} card={card} onPrev={onBack} />

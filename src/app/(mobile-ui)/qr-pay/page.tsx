@@ -1,5 +1,6 @@
 'use client'
 
+import { railUserMessage, railVerdict } from '@/utils/capability-gate'
 import { useSearchParams, useRouter } from 'next/navigation'
 import { useState, useCallback, useMemo, useEffect, useContext, useRef } from 'react'
 import { useSafeBack } from '@/hooks/useSafeBack'
@@ -14,39 +15,48 @@ import { MERCADO_PAGO, PIX } from '@/assets/payment-apps'
 import { getFlagUrl } from '@/constants/countryCurrencyMapping'
 import Image from 'next/image'
 import PeanutLoading from '@/components/Global/PeanutLoading'
+import CyclingLoading from '@/components/Global/PeanutLoading/CyclingLoading'
 import AmountInput from '@/components/Global/AmountInput'
 import { useWallet } from '@/hooks/wallet/useWallet'
 import { useSignSpendBundle } from '@/hooks/wallet/useSignSpendBundle'
-import { InsufficientSpendableError, SessionKeyGrantRequiredError } from '@/hooks/wallet/useSpendBundle'
+import { useStaleSessionGuard } from '@/hooks/wallet/useStaleSessionGuard'
+import { InsufficientSpendableError, SessionKeyGrantRequiredError } from '@/hooks/wallet/spendPreflight'
 import { rainCollateralErrorMessage } from '@/utils/friendly-error.utils'
 import { useRainCardOverview } from '@/hooks/useRainCardOverview'
-import { rainSpendingPowerToWei } from '@/utils/balance.utils'
-import { isTxReverted, saveRedirectUrl, formatNumberForDisplay } from '@/utils/general.utils'
+import {
+    rainCentsToUsdcUnits,
+    INSUFFICIENT_BALANCE_MESSAGE,
+    BALANCE_SETTLING_MESSAGE,
+    isAmountWithinBalance,
+} from '@/utils/balance.utils'
+import { formatNumberForDisplay } from '@/utils/general.utils'
 import { getShakeClass, type ShakeIntensity } from '@/utils/perk.utils'
-import { calculateSavingsInCents, isArgentinaMantecaQrPayment, getSavingsMessage } from '@/utils/qr-payment.utils'
+import { calculateSavingsInCents, hasCardMarkupComparison, getSavingsMessage } from '@/utils/qr-payment.utils'
+import { useCardMarkupRate } from '@/hooks/useCardMarkupRate'
 import ErrorAlert from '@/components/Global/ErrorAlert'
 import { PEANUT_WALLET_CHAIN, PEANUT_WALLET_TOKEN_DECIMALS } from '@/constants/zerodev.consts'
 import { PERK_HOLD_DURATION_MS } from '@/constants/general.consts'
 import { MANTECA_DEPOSIT_ADDRESS } from '@/constants/manteca.consts'
 import { MIN_MANTECA_QR_PAYMENT_AMOUNT, MIN_PIX_AMOUNT_BRL } from '@/constants/payment.consts'
+import { isPixRecurringCode } from '@/utils/withdraw.utils'
 import { formatUnits, parseUnits } from 'viem'
-import type { TransactionReceipt, Hash } from 'viem'
 import { useTransactionDetailsDrawer } from '@/hooks/useTransactionDetailsDrawer'
 import { TransactionDetailsDrawer } from '@/components/TransactionDetails/TransactionDetailsDrawer'
 import { EHistoryUserRole } from '@/hooks/useTransactionHistory'
-import { loadingStateContext } from '@/context'
+import { loadingStateContext } from '@/context/loadingStates.context'
 import { getCurrencyPrice } from '@/app/actions/currency'
 import { PaymentInfoRow } from '@/components/Payment/PaymentInfoRow'
 import { captureException } from '@sentry/nextjs'
 import posthog from 'posthog-js'
 import { ANALYTICS_EVENTS } from '@/constants/analytics.consts'
 import { isPaymentProcessorQR, EQrType, NAME_BY_QR_TYPE, type QrType } from '@/components/Global/DirectSendQR/utils'
-import { QrKycState, useQrKycGate } from '@/hooks/useQrKycGate'
+import { QrKycState } from '@/constants/kyc.consts'
 import ActionModal from '@/components/Global/ActionModal'
 import { SoundPlayer } from '@/components/Global/SoundPlayer'
 import { useQueryClient, useQuery } from '@tanstack/react-query'
 import { shootDoubleStarConfetti } from '@/utils/confetti'
-import { PeanutGuyGIF, STAR_STRAIGHT_ICON } from '@/assets'
+import { PeanutThinking } from '@/assets/mascot'
+import { STAR_STRAIGHT_ICON } from '@/assets/icons'
 import { useAuth } from '@/context/authContext'
 import { PointsAction } from '@/services/services.types'
 import { usePointsConfetti } from '@/hooks/usePointsConfetti'
@@ -58,7 +68,7 @@ import { TRANSACTIONS } from '@/constants/query.consts'
 import { useLimitsValidation } from '@/features/limits/hooks/useLimitsValidation'
 import LimitsWarningCard from '@/features/limits/components/LimitsWarningCard'
 import { getLimitsWarningCardProps, isBrUserEligibleForLimitIncrease } from '@/features/limits/utils'
-import useKycStatus from '@/hooks/useKycStatus'
+import { useCapabilities } from '@/hooks/useCapabilities'
 import { useSumsubActionFlow } from '@/hooks/useSumsubActionFlow'
 import { initiateIncreaseLimits } from '@/app/actions/increase-limits'
 import { SumsubKycWrapper } from '@/components/Kyc/SumsubKycWrapper'
@@ -68,6 +78,24 @@ import { SumsubKycModals } from '@/components/Kyc/SumsubKycModals'
 
 const MAX_QR_PAYMENT_AMOUNT = '2000'
 const MIN_QR_PAYMENT_AMOUNT = '0.1'
+
+// Deterministic provider rejections — retrying the payment-lock query can't
+// change the outcome, so fail fast instead of burning the 3-attempt budget.
+const NON_RETRYABLE_QR_PAY_ERRORS = [
+    'PAYMENT_DESTINATION_DECODING_ERROR',
+    'PIX_MIN_AMOUNT',
+    'PIX_RECURRING_NOT_SUPPORTED',
+]
+
+// Shown wherever the backend rejects a Pix payment below the rail minimum
+// (typed 400 PIX_MIN_AMOUNT — fires at lock-init for merchant-encoded amounts
+// and at re-init for user-entered amounts on open-amount QRs).
+const PIX_MIN_AMOUNT_ERROR_MESSAGE = `This Pix charge is below the ${MIN_PIX_AMOUNT_BRL} BRL minimum for Pix payments.`
+
+// PIX Automático (recurring) codes — rejected at the entry guard for scanned/pasted
+// deep links, and mapped from the backend's typed 400 PIX_RECURRING_NOT_SUPPORTED.
+const PIX_RECURRING_ERROR_MESSAGE =
+    "This QR code is for a recurring payment (PIX Automático). Peanut doesn't support recurring PIX payments — please ask for a regular PIX QR code instead."
 
 type PaymentProcessor = 'MANTECA'
 
@@ -80,8 +108,9 @@ export default function QRPayPage() {
     const qrCode = decodeURIComponent(searchParams.get('qrCode') || '')
     const timestamp = searchParams.get('t')
     const qrType = searchParams.get('type')
-    const { spendableBalance: balance, sendMoney } = useWallet()
+    const { spendableBalance: balance } = useWallet()
     const { signSpend } = useSignSpendBundle()
+    const handleStaleSession = useStaleSessionGuard()
     const { overview: rainCardOverview } = useRainCardOverview()
     const [isSuccess, setIsSuccess] = useState(false)
     const [errorMessage, setErrorMessage] = useState<string | null>(null)
@@ -125,20 +154,131 @@ export default function QRPayPage() {
         return paymentProcessor ? maintenanceConfig.disabledPaymentProviders.includes(paymentProcessor) : false
     }, [paymentProcessor])
 
-    const { shouldBlockPay, kycGateState } = useQrKycGate(paymentProcessor)
-    const { isUserSumsubKycApproved } = useKycStatus()
+    // MIGRATION-REVIEW: QR-pay KYC gate, formerly useQrKycGate + useKycStatus.
+    // Derived inline from the backend capability model. Mapping:
+    //   canDo('pay',{manteca}) → PROCEED_TO_PAY. The BE resolver expresses both
+    //     paths uniformly as an enabled pay op: Sumsub-approved pool users AND
+    //     Sumsub-approved US-nationality-restricted users alike (compliance
+    //     ratified 2026-05-28). No FE special-case needed.
+    //   manteca top-level 'blocked' → PROVIDER_REJECTION_BLOCKED (genuine block —
+    //     no Sumsub, or a non-restriction final rejection).
+    //   manteca top-level 'requires-info' → PROVIDER_REJECTION_FIXABLE.
+    //   manteca 'pending' → IDENTITY_VERIFICATION_IN_PROGRESS.
+    //   otherwise → REQUIRES_IDENTITY_VERIFICATION. While loading → LOADING.
+    // userMessage ← the rejecting rail's reason.userMessage (was useProviderRejectionStatus).
+    const { canDo, railsForProvider, nextActions, isKycApproved, isLoading: isLoadingCapabilities } = useCapabilities()
+    const { user, fetchUser } = useAuth()
+
+    // On public routes (qr-pay) auth still auto-fetches via React Query, but trigger a one-shot
+    // fetch if we landed with no user and nothing in flight, mirroring the old hook's fallback.
+    // `userFetchSettled` flips to true once the fallback fetch resolves (success OR fail) so the
+    // memo below can keep the gate in LOADING until then — without it, the empty-capabilities
+    // shape on a cold load would flash REQUIRES_IDENTITY_VERIFICATION for one paint.
+    const hasRequestedUserFetchRef = useRef(false)
+    const [userFetchSettled, setUserFetchSettled] = useState(false)
+    useEffect(() => {
+        if (!user && !isLoadingCapabilities && !hasRequestedUserFetchRef.current) {
+            hasRequestedUserFetchRef.current = true
+            void fetchUser().finally(() => setUserFetchSettled(true))
+        }
+    }, [user, isLoadingCapabilities, fetchUser])
+
+    const { kycGateState, qrKycUserMessage } = useMemo(() => {
+        // Keep the gate in LOADING until either the user is hydrated OR the fallback
+        // fetch has resolved. Otherwise we briefly map an empty capability shape onto
+        // REQUIRES_IDENTITY_VERIFICATION for users whose auth state hasn't settled yet.
+        if (isLoadingCapabilities || (!user && !userFetchSettled)) {
+            return { kycGateState: QrKycState.LOADING, qrKycUserMessage: null as string | null }
+        }
+        if (canDo('pay', { provider: 'manteca' })) {
+            return { kycGateState: QrKycState.PROCEED_TO_PAY, qrKycUserMessage: null as string | null }
+        }
+        // Verdict-first via the shared railVerdict collapse (rail.resolved,
+        // BE-derived; legacy fallback for older/cached responses). The
+        // US-nationality refinement is applied in the resolver itself
+        // (Sumsub-approved + US-restricted → operations.pay enabled, caught by
+        // canDo above), so a blocked verdict is genuine.
+        const actionByKey = new Map(nextActions.map((action) => [action.key, action]))
+        const candidates = railsForProvider('manteca').map((rail) => ({
+            rail,
+            verdict: railVerdict(rail, actionByKey),
+        }))
+        // provide-email is NOT a document fix: routing it into the Sumsub
+        // upload flow dead-ends the user, and this surface has no email form —
+        // map it to the blocked modal (same rule as deriveProviderRejection).
+        const isProvideEmail = ({ verdict }: (typeof candidates)[number]) =>
+            verdict.blocking?.selfHealKind === 'provide-email'
+        const blocked = candidates.find(
+            (candidate) => candidate.verdict.status === 'blocked' || isProvideEmail(candidate)
+        )
+        if (blocked) {
+            // Country-not-supported is self-fixable: user uploaded a non-AR/BR doc
+            // and can verify again with a different one. Split out for the right CTA.
+            // (selfHealKind is the verdict home; the reason-code check covers legacy
+            // responses — the code rides on blocking.code verbatim.)
+            if (
+                !isProvideEmail(blocked) &&
+                (blocked.verdict.blocking?.selfHealKind === 'restart-identity' ||
+                    blocked.verdict.blocking?.code === 'country_not_supported')
+            ) {
+                return {
+                    kycGateState: QrKycState.PROVIDER_RESTART_IDENTITY,
+                    qrKycUserMessage: railUserMessage(blocked.rail),
+                }
+            }
+            return {
+                kycGateState: QrKycState.PROVIDER_REJECTION_BLOCKED,
+                qrKycUserMessage: railUserMessage(blocked.rail),
+            }
+        }
+        const fixable = candidates.find((candidate) => candidate.verdict.status === 'fixable')
+        if (fixable) {
+            return {
+                kycGateState: QrKycState.PROVIDER_REJECTION_FIXABLE,
+                qrKycUserMessage: railUserMessage(fixable.rail),
+            }
+        }
+        if (candidates.some(({ verdict }) => verdict.status === 'pending')) {
+            return {
+                kycGateState: QrKycState.IDENTITY_VERIFICATION_IN_PROGRESS,
+                qrKycUserMessage: null as string | null,
+            }
+        }
+        return { kycGateState: QrKycState.REQUIRES_IDENTITY_VERIFICATION, qrKycUserMessage: null as string | null }
+    }, [isLoadingCapabilities, canDo, railsForProvider, nextActions, user, userFetchSettled])
+
+    const shouldBlockPay = kycGateState !== QrKycState.PROCEED_TO_PAY
+
     const sumsubFlow = useMultiPhaseKycFlow({})
+
+    // Auto-dismiss the Sumsub flow if the user's QR-pool rails become enabled
+    // server-side while a flow is mid-air. Two known sources:
+    //   1. The `/users/identity` LATAM re-entry path now calls
+    //      `enableQrPoolRails()` BEFORE returning the Manteca action token
+    //      (peanut-api-ts #920) — so the BE can hand back a Sumsub token AND
+    //      have just unlocked QR access in the same request. Without this,
+    //      the SDK pops on top of an already-unlocked user.
+    //   2. Out-of-band capability updates (sibling-tab refresh, manual
+    //      backfill, etc.) flip the gate to PROCEED_TO_PAY while the modal
+    //      is still open. Same outcome — close it.
+    // Cheap watcher, zero added latency on the happy path: relies on the
+    // existing useUserAutoRefresh / fetchUser polling already in place.
+    useEffect(() => {
+        if (kycGateState !== QrKycState.PROCEED_TO_PAY) return
+        if (sumsubFlow.showWrapper || sumsubFlow.isModalOpen) {
+            sumsubFlow.completeFlow()
+        }
+    }, [kycGateState, sumsubFlow.showWrapper, sumsubFlow.isModalOpen, sumsubFlow.completeFlow])
+
     const queryClient = useQueryClient()
     const [isShaking, setIsShaking] = useState(false)
     const [shakeIntensity, setShakeIntensity] = useState<ShakeIntensity>('none')
-    const [isClaimingPerk, setIsClaimingPerk] = useState(false)
     const [perkClaimed, setPerkClaimed] = useState(false)
     const [holdProgress, setHoldProgress] = useState(0)
     const holdTimerRef = useRef<NodeJS.Timeout | null>(null)
     const progressIntervalRef = useRef<NodeJS.Timeout | null>(null)
     const holdStartTimeRef = useRef<number | null>(null)
     const payingStateTimerRef = useRef<NodeJS.Timeout | null>(null)
-    const { user } = useAuth()
     const { setIsSupportModalOpen, openSupportWithMessage: openSupportForLimits } = useModalsContext()
     const [waitingForMerchantAmount, setWaitingForMerchantAmount] = useState(false)
     const retryCount = useRef(0)
@@ -170,7 +310,6 @@ export default function QRPayPage() {
         setWaitingForMerchantAmount(false)
         retryCount.current = 0
         // reset perk states
-        setIsClaimingPerk(false)
         setPerkClaimed(false)
         // reset analytics tracking refs so a new QR flow gets fresh tracking
         hasTrackedPerkShown.current = false
@@ -246,6 +385,13 @@ export default function QRPayPage() {
     useEffect(() => {
         resetState()
 
+        // Before isPaymentProcessorQR: recurrence codes can match PIX_REGEX, and the
+        // specific message must win over the generic "Invalid QR code scanned".
+        if (qrCode && isPixRecurringCode(qrCode)) {
+            setErrorInitiatingPayment(PIX_RECURRING_ERROR_MESSAGE)
+            return
+        }
+
         if (!qrCode || !isPaymentProcessorQR(qrCode)) {
             setErrorInitiatingPayment('Invalid QR code scanned')
             return
@@ -292,7 +438,13 @@ export default function QRPayPage() {
     }, [paymentLock?.code, paymentProcessor])
 
     const isBlockingError = useMemo(() => {
-        return !!errorMessage && errorMessage !== 'Please confirm the transaction.'
+        // The settling failure says "try again in a few seconds" — keep the Pay
+        // button enabled so the user can retry, don't dead-end it like a hard error.
+        return (
+            !!errorMessage &&
+            errorMessage !== 'Please confirm the transaction.' &&
+            errorMessage !== BALANCE_SETTLING_MESSAGE
+        )
     }, [errorMessage])
 
     const usdAmount = useMemo(() => {
@@ -306,6 +458,11 @@ export default function QRPayPage() {
             return paymentLock.paymentAgainstAmount
         }
     }, [paymentLock?.code, paymentLock?.paymentAgainstAmount, amount])
+
+    // Live card-vs-local-rail markup, driven by Manteca's rate + (for ARS)
+    // BCRA's official rate. Used by both the confirm-screen "Save vs card"
+    // row and the success-screen savings message — keeps them in sync.
+    const { data: cardMarkup } = useCardMarkupRate(currency?.code, currency?.price)
 
     // validate payment against user's limits
     // currency comes from payment lock — hook normalizes it internally
@@ -378,11 +535,14 @@ export default function QRPayPage() {
             paymentProcessor === 'MANTECA' &&
             !!qrCode &&
             isPaymentProcessorQR(qrCode) &&
+            // Composite Automático codes also match isPaymentProcessorQR — without
+            // this the entry guard shows its error but the doomed init still fires.
+            !isPixRecurringCode(qrCode) &&
             !paymentLock &&
             !shouldBlockPay,
         retry: (failureCount, error: any) => {
             // Don't retry provider-specific errors
-            if (error?.message?.includes('PAYMENT_DESTINATION_DECODING_ERROR')) {
+            if (NON_RETRYABLE_QR_PAY_ERRORS.some((code) => error?.message?.includes(code))) {
                 return false
             }
             // Retry network/timeout errors up to 2 times (3 total attempts)
@@ -426,6 +586,14 @@ export default function QRPayPage() {
                 )
                 posthog.capture(ANALYTICS_EVENTS.QR_DECODING_ERROR_SHOWN, { qr_type: qrType })
                 setWaitingForMerchantAmount(false)
+            } else if (error.message.includes('PIX_MIN_AMOUNT')) {
+                // Deterministic rejection — the merchant-encoded amount is below
+                // the rail minimum, so there's no merchant amount to wait for.
+                setWaitingForMerchantAmount(false)
+                setErrorInitiatingPayment(PIX_MIN_AMOUNT_ERROR_MESSAGE)
+            } else if (error.message.includes('PIX_RECURRING_NOT_SUPPORTED')) {
+                setWaitingForMerchantAmount(false)
+                setErrorInitiatingPayment(PIX_RECURRING_ERROR_MESSAGE)
             } else {
                 // Network/timeout errors after all retries exhausted
                 setErrorInitiatingPayment(
@@ -464,8 +632,14 @@ export default function QRPayPage() {
                 })
                 setPaymentLock(finalPaymentLock)
             } catch (error) {
-                captureException(error)
-                setErrorMessage('Could not initiate payment due to unexpected error. Please contact support')
+                if (error instanceof Error && error.message.includes('PIX_MIN_AMOUNT')) {
+                    // Deterministic rejection (user-entered amount below the rail
+                    // minimum) — actionable copy, not a Sentry-worthy surprise.
+                    setErrorMessage(PIX_MIN_AMOUNT_ERROR_MESSAGE)
+                } else {
+                    captureException(error)
+                    setErrorMessage('Could not initiate payment due to unexpected error. Please contact support')
+                }
                 setIsSuccess(false)
                 setLoadingState('Idle')
                 return
@@ -492,14 +666,13 @@ export default function QRPayPage() {
             signedArtifact = await signSpend({
                 requiredUsdcAmount,
                 recipient: MANTECA_DEPOSIT_ADDRESS,
-                smartBalance: balance ?? 0n,
-                rainSpendingPower: rainSpendingPowerToWei(rainCardOverview?.balance?.spendingPower),
+                rainSpendingPower: rainCentsToUsdcUnits(rainCardOverview?.balance?.spendingPower),
                 kind: 'QR_PAY',
             })
         } catch (error) {
             const rainMsg = rainCollateralErrorMessage(error)
             if (error instanceof InsufficientSpendableError) {
-                setErrorMessage('Not enough USDC in your wallet or card to cover this payment.')
+                setErrorMessage(BALANCE_SETTLING_MESSAGE)
             } else if (error instanceof SessionKeyGrantRequiredError) {
                 setErrorMessage("One-time card authorization needed. You'll be asked to confirm once.")
             } else if (rainMsg) {
@@ -574,6 +747,9 @@ export default function QRPayPage() {
                 clearTimeout(payingStateTimerRef.current)
                 payingStateTimerRef.current = null
             }
+            // Wrong-passkey session: backend rejected the signed UserOp with
+            // AA24 / wapk. Unrecoverable without re-auth — force a clean logout.
+            if (handleStaleSession(error)) return
             captureException(error)
             const errorMsg = (error as Error).message || 'Could not complete payment'
 
@@ -597,7 +773,17 @@ export default function QRPayPage() {
         } finally {
             setLoadingState('Idle')
         }
-    }, [paymentLock, signSpend, balance, rainCardOverview, qrCode, currencyAmount, setLoadingState, qrType])
+    }, [
+        paymentLock,
+        signSpend,
+        balance,
+        rainCardOverview,
+        qrCode,
+        currencyAmount,
+        setLoadingState,
+        qrType,
+        handleStaleSession,
+    ])
 
     const payQR = useCallback(async () => {
         if (paymentProcessor === 'MANTECA') {
@@ -608,7 +794,7 @@ export default function QRPayPage() {
     // DEV NOTE: This is an OPTIMISTIC claim flow for better UX
     // We immediately show success UI and trigger confetti, then claim in background
     // If claim fails, we show error post-factum but keep the user in success state
-    const claimPerk = useCallback(async () => {
+    const claimPerk = useCallback(() => {
         if (!qrPayment?.externalId) return
 
         // 1. IMMEDIATELY show success UI (optimistic)
@@ -629,34 +815,22 @@ export default function QRPayPage() {
             shootDoubleStarConfetti({ origin: { x: 0.5, y: 0.5 } })
         }, 100)
 
-        // 5. NOW do the actual API claim in the background
-        setIsClaimingPerk(true)
-        try {
-            const result = await mantecaApi.claimPerk(qrPayment.externalId)
-            if (result.success) {
-                posthog.capture(ANALYTICS_EVENTS.REWARD_CLAIMED, {
-                    amount_usd: result.perk.amountSponsored,
-                    discount_pct: result.perk.discountPercentage,
-                })
-                // Update qrPayment with actual claimed perk info from backend
-                setQrPayment({
-                    ...qrPayment,
-                    perk: {
-                        eligible: true,
-                        discountPercentage: result.perk.discountPercentage,
-                        claimed: true,
-                        amountSponsored: result.perk.amountSponsored,
-                        txHash: result.perk.txHash,
-                    },
-                })
-            }
-        } catch (error) {
-            // If claim fails, show error but keep user in success state
-            // (they already saw confetti, better UX than reverting)
-            captureException(error)
-            setErrorMessage('Reward is being processed. If you do not see it in your history, contact support.')
-        } finally {
-            setIsClaimingPerk(false)
+        // 5. Surface the reward. The perk was already issued AND claimed
+        //    server-side during QR-payment processing, and qrPayment.perk
+        //    already carries the sponsored amount from that response — so mark
+        //    it claimed and report it directly. (The old /perks/claim round-trip
+        //    took a mantecaTransferId the endpoint no longer accepts — it now
+        //    requires a usageId the client never has — so it always 400'd: pure
+        //    Sentry noise, and REWARD_CLAIMED never fired because it lived in the
+        //    never-reached success branch. The error it set was invisible here —
+        //    the success screen doesn't render errorMessage.)
+        const claimedPerk = qrPayment.perk
+        if (claimedPerk) {
+            posthog.capture(ANALYTICS_EVENTS.REWARD_CLAIMED, {
+                amount_usd: claimedPerk.amountSponsored,
+                discount_pct: claimedPerk.discountPercentage,
+            })
+            setQrPayment({ ...qrPayment, perk: { ...claimedPerk, claimed: true } })
         }
     }, [qrPayment])
 
@@ -795,8 +969,10 @@ export default function QRPayPage() {
             setBalanceErrorMessage(`QR payment amount exceeds maximum limit of $${MAX_QR_PAYMENT_AMOUNT}`)
         } else if (paymentAmount < parseUnits(MIN_QR_PAYMENT_AMOUNT, PEANUT_WALLET_TOKEN_DECIMALS)) {
             setBalanceErrorMessage(`QR payment amount must be at least $${MIN_QR_PAYMENT_AMOUNT}`)
-        } else if (paymentAmount > balance) {
-            setBalanceErrorMessage('Not enough balance to complete payment. Add funds!')
+        } else if (!isAmountWithinBalance(usdAmount, balance)) {
+            // gate on the displayed total; an in-transit shortfall passes here and
+            // fails late with the settling message at execution.
+            setBalanceErrorMessage(INSUFFICIENT_BALANCE_MESSAGE)
         } else {
             setBalanceErrorMessage(null)
         }
@@ -843,7 +1019,9 @@ export default function QRPayPage() {
         kycGateState === QrKycState.REQUIRES_IDENTITY_VERIFICATION ||
         kycGateState === QrKycState.IDENTITY_VERIFICATION_IN_PROGRESS
     const hasProviderRejection =
-        kycGateState === QrKycState.PROVIDER_REJECTION_FIXABLE || kycGateState === QrKycState.PROVIDER_REJECTION_BLOCKED
+        kycGateState === QrKycState.PROVIDER_REJECTION_FIXABLE ||
+        kycGateState === QrKycState.PROVIDER_REJECTION_BLOCKED ||
+        kycGateState === QrKycState.PROVIDER_RESTART_IDENTITY
 
     // show loading while KYC state is being determined
     if (isLoadingKycState) {
@@ -853,17 +1031,28 @@ export default function QRPayPage() {
     // provider rejection: user is sumsub-approved but manteca rejected
     if (hasProviderRejection) {
         const isFixable = kycGateState === QrKycState.PROVIDER_REJECTION_FIXABLE
+        const isRestartIdentity = kycGateState === QrKycState.PROVIDER_RESTART_IDENTITY
         return (
             <div className="flex min-h-[inherit] flex-col gap-8">
                 <NavHeader title="Pay" />
                 <ActionModal
                     visible
                     onClose={onBack}
-                    title={isFixable ? 'We need an updated document' : 'QR payments are not available'}
+                    title={
+                        isFixable
+                            ? 'We need an updated document'
+                            : isRestartIdentity
+                              ? 'Verify with a different document'
+                              : 'QR payments are not available'
+                    }
                     description={
                         isFixable
                             ? 'We need an updated document to enable QR payments. Please upload a clearer photo of your ID.'
-                            : 'QR payments are not available for your account. Contact support for help.'
+                            : isRestartIdentity
+                              ? (qrKycUserMessage ??
+                                'QR payments need a document from a supported country. You can verify with a different ID.')
+                              : (qrKycUserMessage ??
+                                'QR payments are not available for your account. Contact support for help.')
                     }
                     icon={
                         methodIcon ? (
@@ -879,11 +1068,19 @@ export default function QRPayPage() {
                                   shadowSize: '4' as const,
                                   icon: 'upload',
                               }
-                            : {
-                                  text: 'Contact support',
-                                  onClick: () => setIsSupportModalOpen(true),
-                                  variant: 'stroke' as const,
-                              },
+                            : isRestartIdentity
+                              ? {
+                                    text: 'Verify with a different document',
+                                    onClick: () => sumsubFlow.handleRestartIdentity(),
+                                    variant: 'purple' as const,
+                                    shadowSize: '4' as const,
+                                    icon: 'upload',
+                                }
+                              : {
+                                    text: 'Contact support',
+                                    onClick: () => setIsSupportModalOpen(true),
+                                    variant: 'stroke' as const,
+                                },
                     ]}
                 />
                 <SumsubKycModals flow={sumsubFlow} />
@@ -892,6 +1089,10 @@ export default function QRPayPage() {
     }
 
     // show KYC screens before any error screens - user needs to verify first
+    // MIGRATION-REVIEW: the `crossRegion` flag passed to handleInitiateKyc was `isUserSumsubKycApproved`
+    // (Sumsub identity cleared, only the regional Manteca uplift remains). Sumsub has no rail in the
+    // capability model, so — matching the MantecaFlowManager precedent (commit 8c98a3e81) — isKycApproved
+    // (any enabled rail ⇒ identity verified at least once) is the closest faithful proxy.
     if (needsKycVerification) {
         return (
             <div className="flex min-h-[inherit] flex-col gap-8">
@@ -899,8 +1100,8 @@ export default function QRPayPage() {
                 <ActionModal
                     visible={kycGateState === QrKycState.REQUIRES_IDENTITY_VERIFICATION}
                     onClose={onBack}
-                    title="Verify your identity to continue"
-                    description="You'll need to verify your identity before paying with a QR code. Don't worry it usually just takes a few minutes."
+                    title="Unlock QR payments"
+                    description="Confirm your ID to pay with a QR code. Takes about a minute."
                     icon={
                         methodIcon ? (
                             <Image src={methodIcon} alt="Payment method" width={48} height={48} priority />
@@ -908,12 +1109,12 @@ export default function QRPayPage() {
                     }
                     ctas={[
                         {
-                            text: 'Verify now',
+                            text: 'Unlock now',
                             onClick: () =>
                                 sumsubFlow.handleInitiateKyc(
                                     'LATAM',
                                     undefined,
-                                    isUserSumsubKycApproved || undefined,
+                                    isKycApproved || undefined,
                                     targetMantecaCountry
                                 ),
                             variant: 'purple',
@@ -926,17 +1127,17 @@ export default function QRPayPage() {
                 <ActionModal
                     visible={kycGateState === QrKycState.IDENTITY_VERIFICATION_IN_PROGRESS}
                     onClose={onBack}
-                    title="Complete your verification"
-                    description="Your identity is being verified. If you did not finish the process, please continue to complete it."
+                    title="Almost there"
+                    description="We're confirming your ID. Pick up where you left off and you'll be paying in no time."
                     icon="shield"
                     ctas={[
                         {
-                            text: 'Continue verification',
+                            text: 'Continue',
                             onClick: () =>
                                 sumsubFlow.handleInitiateKyc(
                                     'LATAM',
                                     undefined,
-                                    isUserSumsubKycApproved || undefined,
+                                    isKycApproved || undefined,
                                     targetMantecaCountry
                                 ),
                             variant: 'purple',
@@ -1047,21 +1248,19 @@ export default function QRPayPage() {
     }
 
     // show loading spinner if we're still loading payment data
-    if (isLoadingPaymentData || loadingState.toLowerCase() === 'paying') {
-        return (
-            <PeanutLoading
-                message={loadingState.toLowerCase() === 'paying' ? 'Almost there! Processing payment...' : undefined}
-            />
-        )
+    if (isLoadingPaymentData || loadingState === 'Paying') {
+        return loadingState === 'Paying' ? <CyclingLoading /> : <PeanutLoading />
     }
 
     //Success
     if (isSuccess && paymentProcessor === 'MANTECA' && !qrPayment) {
         return null
     } else if (isSuccess && paymentProcessor === 'MANTECA') {
-        // Calculate savings for Argentina Manteca QR payments only
-        const savingsInCents = calculateSavingsInCents(usdAmount)
-        const showSavingsMessage = savingsInCents > 0 && isArgentinaMantecaQrPayment(qrType, paymentProcessor)
+        // Show "saved $X vs card" only for currencies with a meaningful
+        // card-vs-local-rail gap (ARS, BRL — see CARD_FX_MARKUP_BY_CURRENCY).
+        // Rate is live (BCRA for ARS) via useCardMarkupRate above.
+        const savingsInCents = calculateSavingsInCents(usdAmount, cardMarkup?.rate)
+        const showSavingsMessage = savingsInCents > 0 && hasCardMarkupComparison(currency?.code)
         const savingsMessage = showSavingsMessage ? getSavingsMessage(savingsInCents) : ''
 
         return (
@@ -1165,13 +1364,13 @@ export default function QRPayPage() {
                                 onPointerUp={cancelHold}
                                 onPointerLeave={cancelHold}
                                 onKeyDown={(e) => {
-                                    if ((e.key === 'Enter' || e.key === ' ') && !isClaimingPerk) {
+                                    if (e.key === 'Enter' || e.key === ' ') {
                                         e.preventDefault()
                                         startHold()
                                     }
                                 }}
                                 onKeyUp={(e) => {
-                                    if ((e.key === 'Enter' || e.key === ' ') && !isClaimingPerk) {
+                                    if (e.key === 'Enter' || e.key === ' ') {
                                         e.preventDefault()
                                         cancelHold()
                                     }
@@ -1181,8 +1380,6 @@ export default function QRPayPage() {
                                     e.preventDefault()
                                 }}
                                 shadowSize="4"
-                                disabled={isClaimingPerk}
-                                loading={isClaimingPerk}
                                 className="relative touch-manipulation select-none overflow-hidden"
                                 style={{
                                     WebkitTouchCallout: 'none',
@@ -1292,7 +1489,6 @@ export default function QRPayPage() {
                 onClose={qrLimitIncreaseFlow.handleClose}
                 onComplete={qrLimitIncreaseFlow.handleSdkComplete}
                 onRefreshToken={qrLimitIncreaseFlow.refreshToken}
-                autoStart
                 isMultiLevel
             />
             <div className={`flex min-h-[inherit] flex-col gap-8 ${getShakeClass(isShaking, shakeIntensity)}`}>
@@ -1377,6 +1573,23 @@ export default function QRPayPage() {
                             value={`1 USD = ${currency.price} ${currency.code.toUpperCase()}`}
                             moreInfoText="Rate shown is current but may vary slightly (~$1-5 ARS) until payment is confirmed."
                         />
+                        {(() => {
+                            if (!hasCardMarkupComparison(currency.code)) return null
+                            const savingsInCents = calculateSavingsInCents(usdAmount, cardMarkup?.rate)
+                            if (savingsInCents <= 0) return null
+                            const savingsUsd = (savingsInCents / 100).toFixed(2)
+                            return (
+                                <PaymentInfoRow
+                                    label="Save vs card"
+                                    value={`~$${savingsUsd}`}
+                                    moreInfoText={
+                                        currency.code.toUpperCase() === 'BRL'
+                                            ? 'Foreign cards pay IOF (~3.5%) plus a typical ~3% issuer FX fee. Peanut routes via PIX at the current market rate.'
+                                            : 'Foreign cards apply the official rate plus a typical ~3% issuer FX fee. Peanut routes via MercadoPago at the current market rate.'
+                                    }
+                                />
+                            )
+                        })()}
                         <PaymentInfoRow label="Peanut fee" value="Sponsored by Peanut!" hideBottomBorder />
                     </Card>
 
@@ -1413,7 +1626,8 @@ const QrPayPageLoading = ({ message }: { message: string }) => {
         <div className="my-auto flex h-full w-full flex-col items-center justify-center space-y-4">
             <div className="relative">
                 <Image
-                    src={PeanutGuyGIF}
+                    src={PeanutThinking}
+                    unoptimized
                     alt="Peanut Man"
                     layout="fill"
                     objectFit="contain"

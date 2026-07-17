@@ -117,6 +117,28 @@ Firefox input[type='number'] {
     animation: spin 2s linear infinite;
 }
 
+.cloud-drift {
+    transform: translateX(var(--cloud-from)) scale(var(--cloud-scale));
+    animation-name: cloud-drift;
+    animation-timing-function: linear;
+    animation-iteration-count: infinite;
+}
+
+@keyframes cloud-drift {
+    from {
+        transform: translateX(var(--cloud-from)) scale(var(--cloud-scale));
+    }
+    to {
+        transform: translateX(var(--cloud-to)) scale(var(--cloud-scale));
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .cloud-drift {
+        animation: none;
+    }
+}
+
 .animate-gradient {
     background-size: 300%;
     -webkit-animation: animatedgradient 6s ease infinite alternate;
@@ -516,6 +538,40 @@ input::placeholder {
 
 .animate-slide-in-right {
     animation: slideInRight 0.3s ease-out forwards;
+}
+
+/* Cycling loading word + dots (used by CyclingLoading) */
+@keyframes cyclingFadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(2px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@keyframes cyclingBlink {
+    0%,
+    20% {
+        opacity: 0;
+    }
+    50% {
+        opacity: 1;
+    }
+    100% {
+        opacity: 0;
+    }
+}
+
+.animate-cycling-fade {
+    animation: cyclingFadeIn 240ms ease-out;
+}
+
+.animate-cycling-blink {
+    display: inline-block;
+    animation: cyclingBlink 1.4s infinite both;
 }
 
 /* Gift box opening animations */

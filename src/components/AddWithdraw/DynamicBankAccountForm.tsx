@@ -7,9 +7,10 @@ import { type AddBankAccountPayload, BridgeAccountOwnerType, BridgeAccountType }
 import BaseInput from '@/components/0_Bruddle/BaseInput'
 import BaseSelect from '@/components/0_Bruddle/BaseSelect'
 import { BRIDGE_ALPHA3_TO_ALPHA2, ALL_COUNTRIES_ALPHA3_TO_ALPHA2 } from '@/components/AddMoney/consts'
-import { useParams, useRouter } from 'next/navigation'
+import { useParams, useRouter, useSearchParams } from 'next/navigation'
 import {
     validateIban,
+    validateBankAccount,
     validateBic,
     isValidRoutingNumber,
     isValidSortCode,
@@ -19,7 +20,13 @@ import ErrorAlert from '@/components/Global/ErrorAlert'
 import { getBicFromIban } from '@/app/actions/ibanToBic'
 import PeanutActionDetailsCard, { type PeanutActionDetailsCardProps } from '../Global/PeanutActionDetailsCard'
 import { useWithdrawFlow } from '@/context/WithdrawFlowContext'
-import { getCountryFromIban, validateMXCLabeAccount, validateUSBankAccount } from '@/utils/withdraw.utils'
+import {
+    getCountryFromIban,
+    getCountryCodeForWithdraw,
+    validateMXCLabeAccount,
+    validateUSBankAccount,
+} from '@/utils/withdraw.utils'
+import { createSmartPasteHandler, type PasteFieldKind } from '@/utils/clipboard-extract.utils'
 import useSavedAccounts from '@/hooks/useSavedAccounts'
 import { useAppDispatch, useAppSelector } from '@/redux/hooks'
 import { bankFormActions } from '@/redux/slices/bank-form-slice'
@@ -89,13 +96,23 @@ export const DynamicBankAccountForm = forwardRef<{ handleSubmit: () => void }, D
         const [isSubmitting, setIsSubmitting] = useState(false)
         const [submissionError, setSubmissionError] = useState<string | null>(null)
         const { country: countryNameParams } = useParams()
+        // Native/Capacitor passes country as a query param (?country=usa), so
+        // useParams() is empty there — fall back to searchParams and finally the
+        // `country` prop so this never derefs undefined (white-screen crash).
+        const searchParams = useSearchParams()
         const { amountToWithdraw, setSelectedBankAccount } = useWithdrawFlow()
         const router = useRouter()
         const savedAccounts = useSavedAccounts()
         const [isCheckingBICValid, setisCheckingBICValid] = useState(false)
         const STREET_ADDRESS_MAX_LENGTH = 35 // From bridge docs: street address can be max 35 characters
 
-        let selectedCountry = (countryNameFromProps ?? (countryNameParams as string)).toLowerCase()
+        let selectedCountry = (
+            countryNameFromProps ??
+            (countryNameParams as string) ??
+            searchParams.get('country') ??
+            country ??
+            ''
+        ).toLowerCase()
 
         // Get persisted form data from Redux
         const persistedFormData = useAppSelector((state) => state.bankForm.formData)
@@ -213,11 +230,29 @@ export const DynamicBankAccountForm = forwardRef<{ handleSubmit: () => void }, D
                     ? accountNumber.replace(/\s/g, '').padStart(8, '0')
                     : accountNumber.replace(/\s/g, '')
 
+                // SEPA routes by IBAN, so the destination country must come from the
+                // IBAN itself — not the country picked on the previous screen. We
+                // relaxed the "IBAN must match the selected country" gate, so without
+                // this a German IBAN entered under "Spain" would reach Bridge with
+                // countryCode=ESP and 400. Derive all three country fields from the
+                // IBAN to keep the Bridge payload internally consistent (exactly what
+                // the old equality gate guaranteed, just sourced from the IBAN).
+                // Single normalized IBAN source: the IBAN is entered in the
+                // accountNumber field (→ cleanedAccountNumber), but fall back to the
+                // separate `iban` form value so the country never derives off an empty
+                // string (which would send an empty countryCode to Bridge → 400).
+                const normalizedIban = isIban ? cleanedAccountNumber || (iban || '').replace(/\s/g, '') : ''
+                const ibanCountryCode = isIban
+                    ? getCountryCodeForWithdraw(normalizedIban.slice(0, 2).toUpperCase())
+                    : ''
+                const ibanCountryName = isIban ? (getCountryFromIban(normalizedIban) ?? selectedCountry) : ''
+                const resolvedCountryCode = isUs ? 'USA' : isIban ? ibanCountryCode : country.toUpperCase()
+
                 const payload: Partial<AddBankAccountPayload> = {
                     accountType,
                     accountNumber: cleanedAccountNumber,
-                    countryCode: isUs ? 'USA' : country.toUpperCase(),
-                    countryName: selectedCountry,
+                    countryCode: resolvedCountryCode,
+                    countryName: isIban ? ibanCountryName : selectedCountry,
                     accountOwnerType: BridgeAccountOwnerType.INDIVIDUAL,
                     accountOwnerName: {
                         firstName: firstName.trim(),
@@ -228,7 +263,7 @@ export const DynamicBankAccountForm = forwardRef<{ handleSubmit: () => void }, D
                         city: data.city ?? '',
                         state: data.state ?? '',
                         postalCode: data.postalCode ?? '',
-                        country: isUs ? 'USA' : country.toUpperCase(),
+                        country: resolvedCountryCode,
                     },
                     ...(bic && { bic }),
                 }
@@ -273,6 +308,23 @@ export const DynamicBankAccountForm = forwardRef<{ handleSubmit: () => void }, D
             }
         }
 
+        const smartPasteKindFor = (name: keyof IBankAccountDetails): PasteFieldKind | undefined => {
+            switch (name) {
+                case 'clabe':
+                    return 'clabe'
+                case 'bic':
+                    return 'bic'
+                case 'routingNumber':
+                    return 'routingNumber'
+                case 'sortCode':
+                    return 'ukSortCode'
+                case 'accountNumber':
+                    return isIban ? 'iban' : isUk ? 'ukAccount' : 'usAccount'
+                default:
+                    return undefined
+            }
+        }
+
         const renderInput = (
             name: keyof IBankAccountDetails,
             placeholder: string,
@@ -282,49 +334,59 @@ export const DynamicBankAccountForm = forwardRef<{ handleSubmit: () => void }, D
             onBlur?: (field: any) => Promise<void> | void,
             showCharCount?: boolean,
             maxLength?: number
-        ) => (
-            <div className="w-full">
-                <div className="relative">
-                    <Controller
-                        name={name}
-                        control={control}
-                        rules={rules}
-                        render={({ field }) => (
-                            <BaseInput
-                                {...field}
-                                type={type}
-                                placeholder={placeholder}
-                                className={twMerge(
-                                    'h-12 w-full rounded-sm border border-n-1 bg-white px-4 text-sm',
-                                    errors[name] && touchedFields[name] && 'border-error'
-                                )}
-                                onBlur={async (e) => {
-                                    // remove any whitespace from the input field
-                                    // note: @dev not a great fix, this should also be fixed in the backend
-                                    if (typeof field.value === 'string') {
-                                        field.onChange(field.value.trim())
+        ) => {
+            const smartPasteKind = smartPasteKindFor(name)
+            return (
+                <div className="w-full">
+                    <div className="relative">
+                        <Controller
+                            name={name}
+                            control={control}
+                            rules={rules}
+                            render={({ field }) => (
+                                <BaseInput
+                                    {...field}
+                                    type={type}
+                                    placeholder={placeholder}
+                                    onPaste={
+                                        smartPasteKind
+                                            ? createSmartPasteHandler(smartPasteKind, field.onChange)
+                                            : undefined
                                     }
-                                    field.onBlur()
-                                    if (onBlur) {
-                                        await onBlur(field)
+                                    className={twMerge(
+                                        'h-12 w-full rounded-sm border border-n-1 bg-white px-4 text-sm',
+                                        errors[name] && touchedFields[name] && 'border-error'
+                                    )}
+                                    onBlur={async (e) => {
+                                        // remove any whitespace from the input field
+                                        // note: @dev not a great fix, this should also be fixed in the backend
+                                        if (typeof field.value === 'string') {
+                                            field.onChange(field.value.trim())
+                                        }
+                                        field.onBlur()
+                                        if (onBlur) {
+                                            await onBlur(field)
+                                        }
+                                    }}
+                                    rightContent={
+                                        showCharCount && maxLength ? (
+                                            <span className="text-xs">
+                                                {field.value?.length ?? 0}/{maxLength}
+                                            </span>
+                                        ) : undefined
                                     }
-                                }}
-                                rightContent={
-                                    showCharCount && maxLength ? (
-                                        <span className="text-xs">
-                                            {field.value?.length ?? 0}/{maxLength}
-                                        </span>
-                                    ) : undefined
-                                }
-                            />
+                                />
+                            )}
+                        />
+                    </div>
+                    <div className="mt-2 w-fit text-start">
+                        {errors[name] && touchedFields[name] && (
+                            <ErrorAlert description={errors[name]?.message ?? ''} />
                         )}
-                    />
+                    </div>
                 </div>
-                <div className="mt-2 w-fit text-start">
-                    {errors[name] && touchedFields[name] && <ErrorAlert description={errors[name]?.message ?? ''} />}
-                </div>
-            </div>
-        )
+            )
+        }
 
         const renderSelect = (name: keyof IBankAccountDetails, placeholder: string, options: any[], rules: any) => (
             <div className="w-full">
@@ -453,9 +515,14 @@ export const DynamicBankAccountForm = forwardRef<{ handleSubmit: () => void }, D
                                             const isValidIban = await validateIban(val)
                                             if (!isValidIban) return 'Invalid IBAN'
 
-                                            if (getCountryFromIban(val)?.toLowerCase() !== selectedCountry) {
-                                                return 'IBAN does not match the selected country'
-                                            }
+                                            // SEPA routes by IBAN — the country picked on the
+                                            // previous screen is cosmetic for a EUR payout. Don't
+                                            // force the IBAN's country to equal the dropdown: that
+                                            // false-rejected a German IBAN with Spain selected, and
+                                            // blocked UK users withdrawing EUR to a GB IBAN. Gate on
+                                            // actual support instead (BE allowedCountries: SEPA/US/CA).
+                                            const isSupported = await validateBankAccount(val)
+                                            if (!isSupported) return 'This IBAN isn’t supported for withdrawals'
 
                                             return true
                                         },

@@ -18,16 +18,17 @@
 import StatusBadge from '../../Global/Badges/StatusBadge'
 import IconStack from '../../Global/IconStack'
 import { ClaimBankFlowStep, useClaimBankFlow } from '@/context/ClaimBankFlowContext'
+import { toInviteCode } from '@/utils/general.utils'
 import { type ClaimLinkData } from '@/services/sendLinks'
 import { formatUnits } from 'viem'
 import { useContext, useMemo, useState } from 'react'
 import ActionModal from '@/components/Global/ActionModal'
 import Divider from '../../0_Bruddle/Divider'
 import { Button } from '@/components/0_Bruddle/Button'
-import { PEANUT_LOGO_BLACK } from '@/assets/illustrations'
+import { PEANUT_LOGO_BLACK } from '@/assets/logos'
 import Image from 'next/image'
 import { useRouter } from 'next/navigation'
-import { PEANUTMAN_LOGO } from '@/assets/peanut'
+import { PEANUTMAN } from '@/assets/mascot'
 import { BankClaimType, useDetermineBankClaimType } from '@/hooks/useDetermineBankClaimType'
 import useSavedAccounts from '@/hooks/useSavedAccounts'
 import { tokenSelectorContext } from '@/context'
@@ -43,7 +44,7 @@ import { ActionListCard } from '../../ActionListCard'
 import { useGeoFilteredPaymentOptions } from '@/hooks/useGeoFilteredPaymentOptions'
 import SupportCTA from '../../Global/SupportCTA'
 import { DEVCONNECT_LOGO } from '@/assets'
-import useKycStatus from '@/hooks/useKycStatus'
+import { useCapabilities } from '@/hooks/useCapabilities'
 import {
     MIN_BANK_TRANSFER_AMOUNT,
     MIN_MERCADOPAGO_AMOUNT,
@@ -97,20 +98,29 @@ export default function SendLinkActionList({
         devconnectRecipientAddress,
         devconnectTokenAddress,
     } = useContext(tokenSelectorContext)
-    const { isUserMantecaKycApproved } = useKycStatus()
+    // MIGRATION-REVIEW: mercadopago/pix are QR `pay` methods over Manteca. Old gate was
+    // `isUserMantecaKycApproved`; mapped to canDo('pay', { provider: 'manteca' }) so a Sumsub-
+    // approved user with only the pool-tier pay rail correctly sees these methods as available.
+    const isMantecaPayEnabled = useCapabilities().canDo('pay', { provider: 'manteca' })
     const dispatch = useAppDispatch()
 
     const requiresVerification = useMemo(() => {
         return claimType === BankClaimType.GuestKycNeeded || claimType === BankClaimType.ReceiverKycNeeded
     }, [claimType])
 
+    // Guest claim-to-bank (claimer unverified, but the sender can receive a bank
+    // off-ramp) is under maintenance: the BE 503s POST /bridge/offramp/create-for-guest.
+    // Render the bank option greyed + "Soon!" so guests can't enter a flow that would
+    // fail. The authenticated self off-ramp (UserBankClaim) is unaffected.
+    const isGuestBankClaim = claimType === BankClaimType.GuestBankClaim
+
     // filter and sort payment methods based on geolocation
     const { filteredMethods: sortedActionMethods, isLoading: isGeoLoading } = useGeoFilteredPaymentOptions({
         sortUnavailable: true,
         isMethodUnavailable: (method) =>
             method.soon ||
-            (method.id === 'bank' && requiresVerification) ||
-            (['mercadopago', 'pix'].includes(method.id) && !isUserMantecaKycApproved),
+            (method.id === 'bank' && (requiresVerification || isGuestBankClaim)) ||
+            (['mercadopago', 'pix'].includes(method.id) && !isMantecaPayEnabled),
         methods: showDevconnectMethod
             ? DEVCONNECT_CLAIM_METHODS.filter((method) => method.id !== 'devconnect')
             : undefined,
@@ -146,7 +156,10 @@ export default function SendLinkActionList({
             case 'mercadopago':
             case 'pix':
                 if (!user) {
-                    addParamStep('regional-claim')
+                    // carry the tapped method in the URL: the auth redirect fully
+                    // remounts the flow, and Initial.view restores it from the
+                    // `method` param when it re-enters via step=regional-claim.
+                    addParamStep('regional-claim', { method: method.id })
                     setShowVerificationModal(true)
                     return
                 }
@@ -174,8 +187,7 @@ export default function SendLinkActionList({
         const redirectUri = encodeURIComponent(window.location.pathname + window.location.search + window.location.hash)
         const rawUsername = claimLinkData?.sender?.username
         if (isInviteLink && !userHasAppAccess && rawUsername) {
-            const username = rawUsername.toUpperCase()
-            const inviteCode = `${username}INVITESYOU`
+            const inviteCode = toInviteCode(rawUsername)
             dispatch(setupActions.setInviteCode(inviteCode))
             dispatch(setupActions.setInviteType(EInviteType.PAYMENT_LINK))
             router.push(`/invite?code=${inviteCode}&redirect_uri=${redirectUri}`)
@@ -231,7 +243,7 @@ export default function SendLinkActionList({
                 >
                     {showDevconnectMethod ? <div>Claim on</div> : <div>Continue with </div>}
                     <div className="flex items-center gap-1">
-                        <Image src={PEANUTMAN_LOGO} alt="Peanut Logo" className="size-5" />
+                        <Image src={PEANUTMAN} alt="Peanut Logo" className="size-5" />
                         <Image src={PEANUT_LOGO_BLACK} alt="Peanut Logo" />
                     </div>
                 </Button>
@@ -250,7 +262,7 @@ export default function SendLinkActionList({
             <div className="space-y-2">
                 {sortedActionMethods.map((method) => {
                     let methodRequiresVerification = method.id === 'bank' && requiresVerification
-                    if (!isUserMantecaKycApproved && ['mercadopago', 'pix'].includes(method.id)) {
+                    if (!isMantecaPayEnabled && ['mercadopago', 'pix'].includes(method.id)) {
                         methodRequiresVerification = true
                     }
 
@@ -267,6 +279,7 @@ export default function SendLinkActionList({
                             key={method.id}
                             method={method}
                             requiresVerification={methodRequiresVerification}
+                            soon={method.id === 'bank' && isGuestBankClaim}
                         />
                     )
                 })}
@@ -317,12 +330,17 @@ const MethodCard = ({
     onClick,
     requiresVerification,
     isDisabled,
+    soon,
 }: {
     method: PaymentMethod
     onClick: () => void
     requiresVerification?: boolean
     isDisabled?: boolean
+    // forces the "Soon!" badge + greyed/non-interactive state even when the
+    // static method config has soon=false (e.g. guest claim-to-bank maintenance)
+    soon?: boolean
 }) => {
+    const showSoon = method.soon || soon
     return (
         <ActionListCard
             position="single"
@@ -331,7 +349,7 @@ const MethodCard = ({
             title={
                 <div className="flex items-center gap-2">
                     {method.title}
-                    {(method.soon || requiresVerification) && (
+                    {(showSoon || requiresVerification) && (
                         <StatusBadge
                             status={requiresVerification ? 'custom' : 'soon'}
                             customText={requiresVerification ? 'REQUIRES VERIFICATION' : ''}
@@ -340,7 +358,7 @@ const MethodCard = ({
                 </div>
             }
             onClick={onClick}
-            isDisabled={method.soon || isDisabled}
+            isDisabled={showSoon || isDisabled}
             rightContent={<IconStack icons={method.icons} iconSize={method.id === 'bank' ? 80 : 24} />}
         />
     )

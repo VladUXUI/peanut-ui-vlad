@@ -13,7 +13,7 @@ import { withdrawBankUrl, rewriteMethodPath } from '@/utils/native-routes'
 import { isCapacitor } from '@/utils/capacitor'
 import EmptyState from '../Global/EmptyStates/EmptyState'
 import { useAuth } from '@/context/authContext'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { DynamicBankAccountForm, type IBankAccountDetails } from './DynamicBankAccountForm'
 import { addBankAccount } from '@/app/actions/users'
 import { type AddBankAccountPayload } from '@/app/actions/types/users.types'
@@ -23,21 +23,20 @@ import { getCountryCodeForWithdraw } from '@/utils/withdraw.utils'
 import { DeviceType, useDeviceType } from '@/hooks/useGetDeviceType'
 import { useAppDispatch } from '@/redux/hooks'
 import { bankFormActions } from '@/redux/slices/bank-form-slice'
-import useKycStatus from '@/hooks/useKycStatus'
-import KycVerifiedOrReviewModal from '../Global/KycVerifiedOrReviewModal'
 import { ActionListCard } from '@/components/ActionListCard'
 import TokenAndNetworkConfirmationModal from '../Global/TokenAndNetworkConfirmationModal'
 import { useMultiPhaseKycFlow } from '@/hooks/useMultiPhaseKycFlow'
 import { SumsubKycModals } from '@/components/Kyc/SumsubKycModals'
 import { InitiateKycModal } from '@/components/Kyc/InitiateKycModal'
-import {
-    useBridgeTransferReadiness,
-    getKycModalVariant,
-    getGateProviderMessage,
-} from '@/hooks/useBridgeTransferReadiness'
-import { useBridgeTosGuard } from '@/hooks/useBridgeTosGuard'
+import { useCapabilities } from '@/hooks/useCapabilities'
+import { getKycModalVariant, getGateUserMessage } from '@/utils/capability-gate'
+import { railJurisdictionForBank } from '@/utils/bridge.utils'
+import { getRegionIntent } from '@/utils/regions.utils'
+import { useTosGuard } from '@/hooks/useTosGuard'
 import { BridgeTosStep } from '@/components/Kyc/BridgeTosStep'
+import ProvideEmailStep from '@/components/Kyc/ProvideEmailStep'
 import { useModalsContext } from '@/context/ModalsContext'
+import underMaintenanceConfig, { PIX_BRAZIL_ONRAMP_MAINTENANCE } from '@/config/underMaintenance.config'
 
 interface AddWithdrawCountriesListProps {
     flow: 'add' | 'withdraw'
@@ -62,10 +61,27 @@ const AddWithdrawCountriesList = ({ flow }: AddWithdrawCountriesListProps) => {
 
     // inline sumsub kyc flow for bridge bank users who need verification
     // regionIntent is NOT passed here to avoid creating a backend record on mount.
-    // intent is passed at call time: handleInitiateKyc('STANDARD')
+    // intent is passed at call time, derived from the destination country.
     const sumsubFlow = useMultiPhaseKycFlow({
         onKycSuccess: () => {
             setIsKycModalOpen(false)
+            // The `view: 'form'` branch below renders DynamicBankAccountForm —
+            // the offramp/withdraw bank-account input form. That's correct for
+            // `flow === 'withdraw'` (user enters THEIR bank account to receive
+            // funds) but completely wrong for `flow === 'add'`, which needs
+            // Bridge's deposit instructions (an account belonging to Bridge
+            // that the user wires TO). Pre-fix this unconditional setView
+            // surfaced the withdraw form under an "Add money" title — the
+            // EEA QA Bug #5 ("Submitted, but still asking for account holder
+            // details when I'm trying to add money"). Route add-money users
+            // to /add-money/[country]/bank instead, which mounts
+            // AddMoneyBankDetails (deposit-instructions display).
+            if (flow === 'add') {
+                const countrySlug = currentCountry?.path
+                // rewriteMethodPath → native: /add-money?country=<slug>&view=bank
+                router.push(countrySlug ? rewriteMethodPath(`/add-money/${countrySlug}/bank`) : '/add-money')
+                return
+            }
             setView('form')
         },
         onManualClose: () => setIsKycModalOpen(false),
@@ -76,17 +92,6 @@ const AddWithdrawCountriesList = ({ flow }: AddWithdrawCountriesListProps) => {
     const [isKycModalOpen, setIsKycModalOpen] = useState(false)
     const formRef = useRef<{ handleSubmit: () => void }>(null)
     const [isSupportedTokensModalOpen, setIsSupportedTokensModalOpen] = useState(false)
-
-    const { isUserKycApproved, isUserBridgeKycUnderReview } = useKycStatus()
-    const { gate } = useBridgeTransferReadiness()
-    const { guardWithTos, showBridgeTos, hideTos } = useBridgeTosGuard()
-    const { setIsSupportModalOpen } = useModalsContext()
-    const [showKycStatusModal, setShowKycStatusModal] = useState(false)
-
-    // close kyc modal when sumsub sdk opens
-    useEffect(() => {
-        if (sumsubFlow.showWrapper) setIsKycModalOpen(false)
-    }, [sumsubFlow.showWrapper])
 
     // read country from path params (web: /add-money/india) or query params (native: /add-money?country=india)
     const countryFromQuery = searchParams.get('country')
@@ -101,6 +106,64 @@ const AddWithdrawCountriesList = ({ flow }: AddWithdrawCountriesListProps) => {
         (country) => country.type === 'country' && country.path === countrySlugFromUrl
     )
 
+    // Provider-blind bank-channel deposit gate, country-scoped to the rail
+    // jurisdiction of the country the user is on. Reads through
+    // useCapabilities's role-aware primitives — see utils/capability-gate.ts.
+    //
+    // SCOPE rationale: without the country narrowing, a stuck/rejected rail in
+    // an unrelated jurisdiction (e.g. a Bridge BANK_TRANSFER_MX row from the
+    // 2026-06-01 sync) trips `blocked-rejection` here and the user sees
+    // "We couldn't unlock this" on a country whose own rail is fine.
+    //
+    // The gate's `kind` is the SOLE go/no-go signal here — same as the sibling
+    // /add-money/[country]/bank/page.tsx. Do NOT layer a separate "is any bank
+    // rail pending?" check on top: a `ready` gate already means the user has a
+    // working in-scope rail, and `deriveGate` deliberately ranks `ready` above
+    // `pending`/`waiting-on-provider` so a pending sibling rail (a legit
+    // second-country enrollment, a still-provisioning rail) can't re-block
+    // them. The prior unscoped `isBankRailUnderReview` check did exactly that
+    // and dead-ended ready users behind a "You're all set / Go back" modal.
+    const { isKycApproved, gateFor } = useCapabilities()
+    const isUserKycApproved = isKycApproved
+    const bankCountry = useMemo(() => railJurisdictionForBank(currentCountry?.id), [currentCountry?.id])
+    const gate = useMemo(() => gateFor('deposit', { channel: 'bank', country: bankCountry }), [gateFor, bankCountry])
+    const { guardWithTos, showBridgeTos, hideTos } = useTosGuard()
+    const [showProvideEmail, setShowProvideEmail] = useState(false)
+    const { setIsSupportModalOpen } = useModalsContext()
+
+    // stores the callback to replay after tos acceptance in the list view
+    const pendingAfterTosRef = useRef<(() => void) | null>(null)
+
+    // close kyc modal when sumsub sdk opens
+    useEffect(() => {
+        if (sumsubFlow.showWrapper) setIsKycModalOpen(false)
+    }, [sumsubFlow.showWrapper])
+
+    /** returns true if the user is gated (caller should return early) */
+    const checkBridgeGate = useCallback(
+        (onAfterTos?: () => void): boolean => {
+            if (gate.kind !== 'ready') {
+                // capabilities still loading OR provider doing internal review —
+                // caller should wait, NOT open a KYC modal. For `loading` we
+                // don't yet know if the user is approved. For `waiting-on-provider`
+                // (Bridge KYC review, post_processing) there's no user action to
+                // take; opening the modal would imply otherwise.
+                if (gate.kind === 'loading' || gate.kind === 'waiting-on-provider') return true
+                if (gate.kind === 'accept-tos') {
+                    pendingAfterTosRef.current = onAfterTos ?? null
+                    guardWithTos()
+                } else if (gate.kind === 'provide-email') {
+                    setShowProvideEmail(true)
+                } else {
+                    setIsKycModalOpen(true)
+                }
+                return true
+            }
+            return false
+        },
+        [gate, guardWithTos]
+    )
+
     const handleFormSubmit = async (
         payload: AddBankAccountPayload,
         rawData: IBankAccountDetails
@@ -111,9 +174,20 @@ const AddWithdrawCountriesList = ({ flow }: AddWithdrawCountriesListProps) => {
 
         // unified bridge gate: tos → fixable rejection → blocked → enrollment
         // return a non-visible error to prevent the form from treating this as success
-        if (gate.type !== 'ready') {
-            if (gate.type === 'accept_tos') {
+        if (gate.kind !== 'ready') {
+            // capabilities still loading OR provider doing internal review —
+            // silently no-op (don't show a KYC modal). `waiting-on-provider`
+            // means no user action available.
+            if (gate.kind === 'loading' || gate.kind === 'waiting-on-provider') {
+                return { error: 'gate_blocked', silent: true }
+            }
+            if (gate.kind === 'accept-tos') {
                 guardWithTos()
+            } else if (gate.kind === 'provide-email') {
+                // A rail that flipped to email-blocked between form-open and submit
+                // is self-serve — open the email sheet, NOT the contact-support KYC
+                // modal (mirrors checkBridgeGate; the whole point of provide-email).
+                setShowProvideEmail(true)
             } else {
                 setIsKycModalOpen(true)
             }
@@ -145,6 +219,14 @@ const AddWithdrawCountriesList = ({ flow }: AddWithdrawCountriesListProps) => {
                 // fallback to the previous method if we can't find the new account
                 // this can happen if the user object is not updated immediately
                 const newAccountFromResponse = result.data as Account
+                // The freshly-added account hasn't surfaced in the user refetch yet.
+                // The add-bank-account response is the projected wire shape, so it
+                // already carries bridgeAccountId + the legacy `type`. Guard: without
+                // a bridgeAccountId the confirm step dead-ends on "Bank account is
+                // missing", so surface a retryable error rather than navigating.
+                if (!newAccountFromResponse?.bridgeAccountId) {
+                    return { error: 'Your bank account is still being set up. Please try again in a moment.' }
+                }
                 // ensure details has accountOwnerName for confirmation page display
                 newAccountFromResponse.details = {
                     ...(newAccountFromResponse.details || {}),
@@ -166,7 +248,12 @@ const AddWithdrawCountriesList = ({ flow }: AddWithdrawCountriesListProps) => {
         // scenario (2): if the user hasn't completed kyc yet
         // name and email are now collected by sumsub sdk — no need to save them beforehand
         if (!isUserKycApproved) {
-            await sumsubFlow.handleInitiateKyc('STANDARD')
+            await sumsubFlow.handleInitiateKyc(
+                getRegionIntent(currentCountry?.region ?? 'rest-of-the-world'),
+                undefined,
+                undefined,
+                currentCountry?.id
+            )
         }
 
         return {}
@@ -181,10 +268,7 @@ const AddWithdrawCountriesList = ({ flow }: AddWithdrawCountriesListProps) => {
             const extraParams = isBankFromSend ? `method=${methodParam}` : undefined
             router.push(rewriteMethodPath(method.path, extraParams))
         } else if (method.id.includes('default-bank-withdraw') || method.id.includes('sepa-instant-withdraw')) {
-            if (isUserBridgeKycUnderReview) {
-                setShowKycStatusModal(true)
-                return
-            }
+            if (checkBridgeGate(() => handleWithdrawMethodClick(method))) return
 
             // Bridge methods: Set in context and navigate for amount input
             setSelectedMethod({
@@ -215,11 +299,7 @@ const AddWithdrawCountriesList = ({ flow }: AddWithdrawCountriesListProps) => {
                 setIsSupportedTokensModalOpen(true)
                 return
             }
-            // show kyc status modal if user is kyc under review
-            if (isUserBridgeKycUnderReview) {
-                setShowKycStatusModal(true)
-                return
-            }
+            if (checkBridgeGate(() => handleAddMethodClick(method))) return
 
             const target = rewriteMethodPath(method.path)
             // force full navigation in capacitor — router.push to same page with
@@ -269,6 +349,55 @@ const AddWithdrawCountriesList = ({ flow }: AddWithdrawCountriesListProps) => {
         )
     }
 
+    // shared modals — rendered once regardless of view (form vs list)
+    const sharedModals = (
+        <>
+            <InitiateKycModal
+                visible={isKycModalOpen}
+                onClose={() => setIsKycModalOpen(false)}
+                onVerify={async () => {
+                    if (gate.kind === 'fixable-rejection') {
+                        await sumsubFlow.handleSelfHealResubmit('BRIDGE')
+                    } else {
+                        await sumsubFlow.handleInitiateKyc(
+                            getRegionIntent(currentCountry?.region ?? 'rest-of-the-world'),
+                            undefined,
+                            gate.kind === 'needs-enrollment' || undefined,
+                            currentCountry?.id
+                        )
+                    }
+                }}
+                onContactSupport={() => {
+                    setIsKycModalOpen(false)
+                    setIsSupportModalOpen(true)
+                }}
+                isLoading={sumsubFlow.isLoading}
+                error={sumsubFlow.error}
+                variant={getKycModalVariant(gate.kind)}
+                providerMessage={getGateUserMessage(gate)}
+                regionName={currentCountry?.title}
+            />
+            <BridgeTosStep
+                visible={showBridgeTos}
+                onComplete={() => {
+                    hideTos()
+                    const replay = pendingAfterTosRef.current
+                    pendingAfterTosRef.current = null
+                    if (replay) replay()
+                    else formRef.current?.handleSubmit()
+                }}
+                onSkip={hideTos}
+                reasonCode={gate.kind === 'accept-tos' ? gate.reason?.code : undefined}
+            />
+            <ProvideEmailStep
+                visible={showProvideEmail}
+                onComplete={() => setShowProvideEmail(false)}
+                onSkip={() => setShowProvideEmail(false)}
+            />
+            <SumsubKycModals flow={sumsubFlow} />
+        </>
+    )
+
     if (view === 'form') {
         return (
             <div className="flex min-h-[inherit] flex-col justify-normal gap-8">
@@ -307,39 +436,7 @@ const AddWithdrawCountriesList = ({ flow }: AddWithdrawCountriesListProps) => {
                     initialData={{}}
                     error={null}
                 />
-                <InitiateKycModal
-                    visible={isKycModalOpen}
-                    onClose={() => setIsKycModalOpen(false)}
-                    onVerify={async () => {
-                        if (gate.type === 'fixable_rejection') {
-                            await sumsubFlow.handleSelfHealResubmit('BRIDGE')
-                        } else {
-                            await sumsubFlow.handleInitiateKyc(
-                                'STANDARD',
-                                undefined,
-                                gate.type === 'needs_enrollment' || undefined
-                            )
-                        }
-                    }}
-                    onContactSupport={() => {
-                        setIsKycModalOpen(false)
-                        setIsSupportModalOpen(true)
-                    }}
-                    isLoading={sumsubFlow.isLoading}
-                    error={sumsubFlow.error}
-                    variant={getKycModalVariant(gate.type)}
-                    providerMessage={getGateProviderMessage(gate)}
-                    regionName={currentCountry?.title}
-                />
-                <BridgeTosStep
-                    visible={showBridgeTos}
-                    onComplete={() => {
-                        hideTos()
-                        formRef.current?.handleSubmit()
-                    }}
-                    onSkip={hideTos}
-                />
-                <SumsubKycModals flow={sumsubFlow} />
+                {sharedModals}
             </div>
         )
     }
@@ -353,58 +450,76 @@ const AddWithdrawCountriesList = ({ flow }: AddWithdrawCountriesListProps) => {
             <div className="space-y-2">
                 <h2 className="text-base font-bold">{title}</h2>
                 <div className="flex flex-col">
-                    {paymentMethods.map((method, index) => (
-                        <ActionListCard
-                            key={method.id}
-                            isDisabled={method.isSoon}
-                            title={method.title}
-                            description={method.description}
-                            descriptionClassName={'text-xs'}
-                            leftIcon={
-                                typeof method.icon === 'string' || method.icon === undefined ? (
-                                    <AvatarWithBadge
-                                        icon={method.icon as IconName}
-                                        name={method.title ?? method.id}
-                                        size="extra-small"
-                                        inlineStyle={{
-                                            backgroundColor:
-                                                method.icon === ('bank' as IconName)
-                                                    ? '#FFC900'
-                                                    : method.id === 'crypto-add' || method.id === 'crypto-withdraw'
-                                                      ? '#FFC900'
-                                                      : getColorForUsername(method.title).lightShade,
-                                            color: method.icon === ('bank' as IconName) ? 'black' : 'black',
-                                        }}
-                                    />
-                                ) : (
-                                    <Image
-                                        src={method.icon as StaticImageData}
-                                        alt={method.id}
-                                        className="h-8 w-8 rounded-full"
-                                        width={32}
-                                        height={32}
-                                    />
-                                )
-                            }
-                            rightContent={method.isSoon ? <StatusBadge status="soon" size="small" /> : null}
-                            onClick={() => {
-                                if (flow === 'withdraw') {
-                                    handleWithdrawMethodClick(method)
-                                } else if (method.path) {
-                                    handleAddMethodClick(method)
+                    {paymentMethods.map((method, index) => {
+                        // BRL-via-PIX onramp is warn-only under maintenance: tag the Pix option but
+                        // keep it clickable (do not set isDisabled).
+                        const isPixOnrampUnderMaintenance =
+                            flow === 'add' &&
+                            method.id === 'pix-add' &&
+                            underMaintenanceConfig.pixBrazilOnrampMaintenance
+                        return (
+                            <ActionListCard
+                                key={method.id}
+                                isDisabled={method.isSoon}
+                                title={method.title}
+                                description={method.description}
+                                descriptionClassName={'text-xs'}
+                                leftIcon={
+                                    typeof method.icon === 'string' || method.icon === undefined ? (
+                                        <AvatarWithBadge
+                                            icon={method.icon as IconName}
+                                            name={method.title ?? method.id}
+                                            size="extra-small"
+                                            inlineStyle={{
+                                                backgroundColor:
+                                                    method.icon === ('bank' as IconName)
+                                                        ? '#FFC900'
+                                                        : method.id === 'crypto-add' || method.id === 'crypto-withdraw'
+                                                          ? '#FFC900'
+                                                          : getColorForUsername(method.title).lightShade,
+                                                color: method.icon === ('bank' as IconName) ? 'black' : 'black',
+                                            }}
+                                        />
+                                    ) : (
+                                        <Image
+                                            src={method.icon as StaticImageData}
+                                            alt={method.id}
+                                            className="h-8 w-8 rounded-full"
+                                            width={32}
+                                            height={32}
+                                        />
+                                    )
                                 }
-                            }}
-                            position={
-                                paymentMethods.length === 1
-                                    ? 'single'
-                                    : index === 0
-                                      ? 'first'
-                                      : index === paymentMethods.length - 1
-                                        ? 'last'
-                                        : 'middle'
-                            }
-                        />
-                    ))}
+                                rightContent={
+                                    method.isSoon ? (
+                                        <StatusBadge status="soon" size="small" />
+                                    ) : isPixOnrampUnderMaintenance ? (
+                                        <StatusBadge
+                                            status="pending"
+                                            customText={PIX_BRAZIL_ONRAMP_MAINTENANCE.badge}
+                                            size="small"
+                                        />
+                                    ) : null
+                                }
+                                onClick={() => {
+                                    if (flow === 'withdraw') {
+                                        handleWithdrawMethodClick(method)
+                                    } else if (method.path) {
+                                        handleAddMethodClick(method)
+                                    }
+                                }}
+                                position={
+                                    paymentMethods.length === 1
+                                        ? 'single'
+                                        : index === 0
+                                          ? 'first'
+                                          : index === paymentMethods.length - 1
+                                            ? 'last'
+                                            : 'middle'
+                                }
+                            />
+                        )
+                    })}
                 </div>
             </div>
         )
@@ -450,11 +565,7 @@ const AddWithdrawCountriesList = ({ flow }: AddWithdrawCountriesListProps) => {
                     isVisible={isSupportedTokensModalOpen}
                 />
             )}
-            <KycVerifiedOrReviewModal
-                isKycApprovedModalOpen={showKycStatusModal}
-                onClose={() => setShowKycStatusModal(false)}
-            />
-            <SumsubKycModals flow={sumsubFlow} />
+            {sharedModals}
         </div>
     )
 }

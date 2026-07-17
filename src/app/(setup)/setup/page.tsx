@@ -12,13 +12,20 @@ import UnsupportedBrowserModal from '@/components/Global/UnsupportedBrowserModal
 import { isLikelyWebview, isDeviceOsSupported } from '@/components/Setup/Setup.utils'
 import { isCapacitor } from '@/utils/capacitor'
 import { getFromCookie } from '@/utils/general.utils'
+import { useSearchParams } from 'next/navigation'
 import { DeviceType, useDeviceType } from '@/hooks/useGetDeviceType'
 import { useAuth } from '@/context/authContext'
+import { useRouter } from 'next/navigation'
+import { Button } from '@/components/0_Bruddle/Button'
+import { PeanutWavingHello } from '@/assets/mascot'
+import posthog from 'posthog-js'
+import { ANALYTICS_EVENTS } from '@/constants/analytics.consts'
 
 function SetupPageContent() {
     const { steps, inviteCode } = useSetupStore()
     const { step, handleNext, handleBack } = useSetupFlow()
-    const { logoutUser, isLoggingOut } = useAuth()
+    const { logoutUser, isLoggingOut, user, isFetchingUser } = useAuth()
+    const router = useRouter()
     const [direction, setDirection] = useState(0)
     const [currentStepIndex, setCurrentStepIndex] = useState(0)
     const [deferredPrompt, setDeferredPrompt] = useState<BeforeInstallPromptEvent | null>(null)
@@ -29,6 +36,40 @@ function SetupPageContent() {
     const [showDeviceNotSupportedModal, setShowDeviceNotSupportedModal] = useState(false)
     const [showBrowserNotSupportedModal, setShowBrowserNotSupportedModal] = useState(false)
     const { deviceType: detectedDeviceType } = useDeviceType()
+    const searchParams = useSearchParams()
+    const [sessionChecked, setSessionChecked] = useState(false)
+    const [existingSessionUsername, setExistingSessionUsername] = useState<string | null>(null)
+
+    /*
+     * A device can arrive at /setup already authenticated: a half-completed
+     * earlier signup leaves durable credentials (jwt cookie in the native jar,
+     * web-authn-key cookie), and running signup on top of them silently no-ops
+     * — the passkey step would skip and the freshly chosen username would be
+     * discarded. Check once, at entry only: `sessionChecked` stays true for the
+     * rest of the flow, so the user becoming authenticated mid-signup (after
+     * registration) never re-triggers the prompt.
+     */
+    useEffect(() => {
+        if (sessionChecked || isFetchingUser) return
+        setSessionChecked(true)
+        if (user?.user?.username) {
+            setExistingSessionUsername(user.user.username)
+            posthog.capture(ANALYTICS_EVENTS.SIGNUP_EXISTING_SESSION_PROMPTED, {
+                has_app_access: !!user.user.hasAppAccess,
+            })
+        }
+    }, [sessionChecked, isFetchingUser, user])
+
+    const handleContinueSession = () => {
+        posthog.capture(ANALYTICS_EVENTS.SIGNUP_EXISTING_SESSION_CONTINUED)
+        router.push('/home')
+    }
+
+    const handleStartFresh = async () => {
+        posthog.capture(ANALYTICS_EVENTS.SIGNUP_EXISTING_SESSION_LOGGED_OUT)
+        await logoutUser()
+        setExistingSessionUsername(null)
+    }
 
     useEffect(() => {
         const determineInitialStep = async () => {
@@ -42,16 +83,30 @@ function SetupPageContent() {
             setIsLoading(true)
             await new Promise((resolve) => setTimeout(resolve, 100)) // ensure other initializations can complete
 
+            // Skip the invite-code gate straight to signup when either:
+            //  - an invite code is present (cookie survives the PWA-install hop), or
+            //  - the URL asks for it via ?step=signup — the signal every campaign /
+            //    skip flow already sends (ShhhhhLandingPage, InvitesPage.handleClaim)
+            //    when it pushes to /setup. useZeroDev still reads the campaignTag
+            //    cookie post-signup to award the badge; the step decision no longer
+            //    trusts that cookie.
+            //
+            // Why not the campaignTag cookie: it's a session cookie cleared only on a
+            // successful signup, so a returning user who claimed a campaign earlier in
+            // the same session was routed past Landing (the only screen with Log In)
+            // onto Signup, unable to log back in (regression from PR #2346).
+            const inviteCodeFromCookie = getFromCookie('inviteCode')
+            const userInviteCode = inviteCode || inviteCodeFromCookie
+            const skipInviteGate = !!userInviteCode || searchParams.get('step') === 'signup'
+
             const localDeviceType = detectedDeviceType
 
             // in capacitor, passkeys are handled natively — skip all browser/webview/os/pwa checks
             // and go straight to the landing (signup) flow
             if (isCapacitor()) {
                 setDeviceType(localDeviceType)
-                // check for invite code — if present, go to signup instead of landing
-                const inviteCodeFromCookie = getFromCookie('inviteCode')
-                const userInviteCode = inviteCode || inviteCodeFromCookie
-                const targetStep = userInviteCode ? 'signup' : 'landing'
+                // invite code or ?step=signup → straight to signup, else landing
+                const targetStep = skipInviteGate ? 'signup' : 'landing'
                 const stepIndex = steps.findIndex((s: ISetupStep) => s.screenId === targetStep)
                 if (stepIndex !== -1) {
                     dispatch(setupActions.setStep(stepIndex + 1))
@@ -140,13 +195,8 @@ function SetupPageContent() {
                 determinedSetupInitialStepId = 'pwa-install'
             }
 
-            const inviteCodeFromCookie = getFromCookie('inviteCode')
-
-            // invite code can also be store in cookies, so we need to check both
-            const userInviteCode = inviteCode || inviteCodeFromCookie
-
-            // If invite code is present, set the step to the signup screen
-            if (determinedSetupInitialStepId && userInviteCode) {
+            // If an invite code or ?step=signup is present, jump to signup
+            if (determinedSetupInitialStepId && skipInviteGate) {
                 const signupScreenIndex = steps.findIndex((s: ISetupStep) => s.screenId === 'signup')
                 dispatch(setupActions.setStep(signupScreenIndex + 1))
             } else if (determinedSetupInitialStepId) {
@@ -179,7 +229,7 @@ function SetupPageContent() {
         return () => {
             window.removeEventListener('beforeinstallprompt', handleBeforeInstallPrompt)
         }
-    }, [dispatch, steps])
+    }, [dispatch, steps, searchParams])
 
     useEffect(() => {
         if (step) {
@@ -189,12 +239,34 @@ function SetupPageContent() {
         }
     }, [step, currentStepIndex, steps])
 
-    if (isLoading)
+    if (isLoading || !sessionChecked)
         return (
             <div className="flex h-[100dvh] w-full flex-col items-center justify-center">
                 <PeanutLoading />
             </div>
         )
+
+    if (existingSessionUsername) {
+        return (
+            <SetupWrapper
+                layoutType="signup"
+                screenId="welcome"
+                image={PeanutWavingHello.src}
+                title="You're already signed in"
+                description={`This device is signed in as ${existingSessionUsername}. Continue with that account, or log out to create a new one.`}
+                contentClassName="flex flex-col items-center justify-center gap-5"
+            >
+                <div className="flex w-full flex-col gap-3">
+                    <Button shadowSize="4" onClick={handleContinueSession} disabled={isLoggingOut}>
+                        Continue as {existingSessionUsername}
+                    </Button>
+                    <Button variant="stroke" onClick={handleStartFresh} loading={isLoggingOut} disabled={isLoggingOut}>
+                        Log out & start fresh
+                    </Button>
+                </div>
+            </SetupWrapper>
+        )
+    }
 
     // if no step is determined and no blocking modal is shown, it's an issue
     if (!step && !showDeviceNotSupportedModal && !showBrowserNotSupportedModal) {

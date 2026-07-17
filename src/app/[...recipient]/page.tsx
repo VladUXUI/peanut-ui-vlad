@@ -7,8 +7,9 @@ import { isAddress } from 'viem'
 import { printableAddress, isStableCoin } from '@/utils/general.utils'
 import { chargesApi } from '@/services/charges'
 import { parseAmountAndToken } from '@/lib/url-parser/parser'
+import { buildOgImageUrl } from '@/utils/og.utils'
 import { notFound } from 'next/navigation'
-import { isReservedRoute } from '@/constants/routes'
+import { couldBeRecipient, isReservedRoute } from '@/constants/routes'
 
 type PageProps = {
     params: Promise<{ recipient?: string[] }>
@@ -26,6 +27,12 @@ export async function generateMetadata({ params, searchParams }: any) {
 
     // Guard: Ensure recipient exists
     if (!resolvedParams.recipient?.[0]) {
+        return {}
+    }
+
+    // Guard: Don't generate "X on Peanut" metadata for things that can't be recipients
+    // (bare locale codes, slugs with dashes, random strings). Lets the 404 page own the tab title.
+    if (!couldBeRecipient(firstSegment!)) {
         return {}
     }
 
@@ -93,30 +100,19 @@ export async function generateMetadata({ params, searchParams }: any) {
         if (!siteUrl) {
             console.error('Error: Unable to determine site origin')
         } else {
-            const ogUrl = new URL(`${siteUrl}/api/og`)
-            ogUrl.searchParams.set('type', 'request')
-            ogUrl.searchParams.set('username', recipient)
-
-            if (amount) {
-                ogUrl.searchParams.set('amount', String(amount))
-                if (token) {
-                    ogUrl.searchParams.set('token', token.toUpperCase())
-                }
-            } else {
-                // For ETH addresses/ENS without amount, set to 0 to show "is requesting funds"
-                ogUrl.searchParams.set('amount', '0')
-            }
-
-            // Only show as receipt if there's both a chargeId AND it's paid
-            if (chargeId && isPaid) {
-                ogUrl.searchParams.set('isReceipt', 'true')
-            }
-
-            if (isPeanutUsername) {
-                ogUrl.searchParams.set('isPeanutUsername', 'true')
-            }
-
-            ogImageUrl = ogUrl.toString()
+            ogImageUrl = buildOgImageUrl(
+                {
+                    type: 'request',
+                    username: recipient,
+                    // ETH addresses/ENS without an amount use 0 to show "is requesting funds"
+                    amount: amount ? String(amount) : '0',
+                    token: amount && token ? token.toUpperCase() : undefined,
+                    // only a receipt when there's a chargeId AND it's paid
+                    isReceipt: Boolean(chargeId && isPaid),
+                    isPeanutUsername,
+                },
+                siteUrl
+            )
         }
     }
 
@@ -193,6 +189,13 @@ export default function Page(props: PageProps) {
     // If we reach here, it means Next.js routing didn't catch it properly
     const firstSegment = recipient[0]
     if (firstSegment && isReservedRoute(`/${firstSegment}`)) {
+        notFound()
+    }
+
+    // Guard: anything that can't be a username/address/ENS/handle is a 404, not a profile.
+    // Pre-Feb-21 indexed URLs like /es/argentina previously fell through here and rendered
+    // a "es on Peanut" profile page — that's the regression this guards against.
+    if (firstSegment && !couldBeRecipient(firstSegment)) {
         notFound()
     }
 

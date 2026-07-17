@@ -1,18 +1,6 @@
 import { type HistoryEntry } from '@/hooks/useTransactionHistory'
 import { type TransactionStrategy, type TransactionStrategyOutput } from '../types'
-
-/** Rain often returns merchant names ALL-CAPS when its enrichment pipeline
- *  doesn't recognize the brand ("BOYACA", "ANTHROPIC"). When that happens,
- *  display them in Title Case for readability — but only when the name is
- *  long enough that title-casing won't garble a real acronym (KFC, IBM,
- *  BBC stay as-is). Mixed-case names are returned unchanged so enriched
- *  brand names like "iPhone Store" or "Acme Coffee" aren't mangled. */
-const ACRONYM_LENGTH_THRESHOLD = 4
-function normalizeMerchantName(raw: string): string {
-    if (raw !== raw.toUpperCase()) return raw
-    if (raw.length <= ACRONYM_LENGTH_THRESHOLD) return raw
-    return raw.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase())
-}
+import { isNegativeWireAmount, normalizeMerchantName } from '@/components/TransactionDetails/transaction-details.utils'
 
 export const qrPay: TransactionStrategy = (entry: HistoryEntry): TransactionStrategyOutput => {
     const raw = entry.recipientAccount?.identifier
@@ -26,6 +14,14 @@ export const qrPay: TransactionStrategy = (entry: HistoryEntry): TransactionStra
 }
 
 export const cardSpend: TransactionStrategy = (entry: HistoryEntry): TransactionStrategyOutput => {
+    // Rain card refunds arrive as negative-amount spend auths (a credit
+    // authorization booked under the same CARD_SPEND_* kinds, all of which
+    // route here). BE flags them via extraData.isRefund; until that ships we
+    // also detect the negative wire amount directly, so PR 1 works against
+    // today's payload. Either way, render them as a refund credit.
+    if (entry.extraData?.isRefund === true || isNegativeWireAmount(entry.amount)) {
+        return cardRefund(entry)
+    }
     const merchantName = (entry.extraData?.merchantName as string | null | undefined) ?? null
     return {
         direction: 'qr_payment',
@@ -44,7 +40,7 @@ export const cardRefund: TransactionStrategy = (entry: HistoryEntry): Transactio
     const cleaned = merchantName ? normalizeMerchantName(merchantName) : null
     return {
         direction: 'receive',
-        transactionCardType: 'receive',
+        transactionCardType: 'refund',
         nameForDetails: cleaned ? `Refund from ${cleaned}` : 'Card refund',
         isPeerActuallyUser: false,
         isLinkTx: false,

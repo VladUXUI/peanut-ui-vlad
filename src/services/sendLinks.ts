@@ -1,16 +1,55 @@
-import { jsonParse, jsonStringify } from '@/utils/general.utils'
+import { jsonParse, jsonStringify, getFromLocalStorage, saveToLocalStorage } from '@/utils/general.utils'
 import { generateKeysFromString, getParamsFromLink } from '@/utils/peanut-link.utils'
 import type { SendLink } from '@/services/services.types'
 import { serverFetch } from '@/utils/api-fetch'
 import { getAuthHeaders } from '@/utils/auth-token'
 import { fetchWithSentry } from '@/utils/sentry.utils'
 import { PEANUT_API_URL } from '@/constants/general.consts'
+import { isDemoMode } from '@/utils/demo'
 
 export { ESendLinkStatus } from '@/services/services.types'
 export type { SendLinkStatus, SendLink } from '@/services/services.types'
 export { getParamsFromLink } from '@/utils/peanut-link.utils'
 
 export type ClaimLinkData = SendLink & { link: string; password: string }
+
+const CLAIM_LINK_SLOT_PREFIX = 'claim-link-slot'
+// KYC review between opening a link and returning to claim can span days.
+const CLAIM_LINK_TTL_SECONDS = 7 * 24 * 60 * 60
+
+/**
+ * Resolve the link used to fetch + claim a send link, hardened against the
+ * auth/KYC redirect mangling the URL's `#p=` password fragment (TASK-20193).
+ *
+ * The recipient opens `/claim?c=&v=&i=#p=<password>`; the password derives the
+ * deterministic pubKey the backend is keyed on. The guest → /setup → KYC →
+ * /claim flow fully remounts the page, and across that multi-hop redirect the
+ * fragment can come back corrupted while the `c/v/i` query survives — so the
+ * remounted page derives the WRONG pubKey and gets a 404 "Send link not found",
+ * dead-ending the claim.
+ *
+ * Fix: key the pristine link by its deposit slot (chain:version:index, which
+ * the redirect preserves) in localStorage when the link is first opened.
+ * First write wins, so the correct password stays authoritative even if a
+ * later remount arrives with a broken fragment.
+ */
+export const resolveClaimLink = (currentLink: string): string => {
+    if (typeof window === 'undefined') return currentLink
+    let params: ReturnType<typeof getParamsFromLink>
+    try {
+        params = getParamsFromLink(currentLink)
+    } catch {
+        return currentLink
+    }
+    // Without a real deposit slot we can't key the link — leave it untouched.
+    if (!params.chainId || Number.isNaN(params.depositIdx)) return currentLink
+
+    const key = `${CLAIM_LINK_SLOT_PREFIX}::${params.chainId}:${params.contractVersion}:${params.depositIdx}`
+    const stored = getFromLocalStorage(key)
+    if (typeof stored === 'string' && stored) return stored // pristine link wins
+    if (params.password) saveToLocalStorage(key, currentLink, CLAIM_LINK_TTL_SECONDS)
+    return currentLink
+}
 
 type CreateLinkBody = {
     pubKey: string
@@ -24,6 +63,10 @@ type CreateLinkBody = {
     contractVersion?: string
     amount?: bigint
     tokenAddress?: string
+    // Set only for collateral-funded ("mixed") links: the Rain prepare intent
+    // id (`intentId` from useSpendBundle). Lets the backend adopt that intent as
+    // the canonical SEND_LINK instead of creating a duplicate.
+    preparationId?: string
 }
 
 type UpdateLinkBody = {
@@ -38,6 +81,14 @@ type UpdateLinkBody = {
 
 export const sendLinksApi = {
     create: async (sendLink: CreateLinkBody): Promise<SendLink> => {
+        // This call bypasses callApi (multipart upload), so the demo interceptor
+        // is invoked explicitly here. Lazy import keeps the demo module out of
+        // this service's module graph on web/tests.
+        if (isDemoMode()) {
+            const { demoRespond } = await import('@/utils/demo-api')
+            return jsonParse(await (await demoRespond('/send-links', { method: 'POST' })).text())
+        }
+
         let requestBody: FormData | string
         const headers: Record<string, string> = {}
 

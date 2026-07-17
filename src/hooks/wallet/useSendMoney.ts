@@ -6,14 +6,11 @@ import { TRANSACTIONS, BALANCE_DECREASE, SEND_MONEY } from '@/constants/query.co
 import { useToast } from '@/components/0_Bruddle/Toast'
 import { useBalance } from './useBalance'
 import { useRainCardOverview, RAIN_CARD_OVERVIEW_QUERY_KEY } from '../useRainCardOverview'
-import { rainSpendingPowerToWei } from '@/utils/balance.utils'
+import { rainCentsToUsdcUnits, BALANCE_SETTLING_MESSAGE } from '@/utils/balance.utils'
+import { notifyHaptic } from '@/utils/haptics'
 import type { RainCollateralKind } from '@/services/rain'
-import {
-    InsufficientSpendableError,
-    SessionKeyGrantRequiredError,
-    type SpendStrategy,
-    useSpendBundle,
-} from './useSpendBundle'
+import { useSpendBundle } from './useSpendBundle'
+import { InsufficientSpendableError, SessionKeyGrantRequiredError, type SpendStrategy } from './spendPreflight'
 
 type SendMoneyParams = {
     toAddress: Address
@@ -53,7 +50,9 @@ export const useSendMoney = ({ address }: UseSendMoneyOptions) => {
     const queryClient = useQueryClient()
     const toast = useToast()
     const { spend } = useSpendBundle()
-    const { data: smartBalance } = useBalance(address)
+    // Keep the smart-account balance query subscribed/warm for the optimistic
+    // update in onMutate; spend() reads its OWN live balance for routing.
+    useBalance(address)
     const { overview } = useRainCardOverview()
 
     return useMutation({
@@ -73,8 +72,7 @@ export const useSendMoney = ({ address }: UseSendMoneyOptions) => {
             const result = await spend({
                 requiredUsdcAmount: amountToSend,
                 recipient: toAddress,
-                smartBalance: smartBalance ?? 0n,
-                rainSpendingPower: rainSpendingPowerToWei(overview?.balance?.spendingPower),
+                rainSpendingPower: rainCentsToUsdcUnits(overview?.balance?.spendingPower),
                 kind,
                 chargeId,
                 onStrategyDecided,
@@ -102,6 +100,8 @@ export const useSendMoney = ({ address }: UseSendMoneyOptions) => {
         },
 
         onSuccess: () => {
+            // Native success buzz — feels like a real payment confirmation.
+            notifyHaptic('success')
             // Refresh both buckets. For collateral-only the smart balance didn't
             // actually change, but invalidating is cheap and keeps the display honest.
             queryClient.invalidateQueries({ queryKey: ['balance', address] })
@@ -116,10 +116,18 @@ export const useSendMoney = ({ address }: UseSendMoneyOptions) => {
                 queryClient.setQueryData(['balance', address], context.previousBalance)
             }
 
+            // The spend may have read a fresh live balance mid-flight (useSpendBundle's
+            // fetchLiveSmartUsdcBalance) that the rollback above just discarded —
+            // refetch so the displayed balance settles on on-chain truth, not the
+            // pre-tap cached value.
+            queryClient.invalidateQueries({ queryKey: ['balance', address] })
+
             console.error('[useSendMoney] Transaction failed, rolled back balance:', error)
 
             if (error instanceof InsufficientSpendableError) {
-                toast.error('Insufficient balance for this transfer.')
+                // Passed the display gate but couldn't route yet — useSpendBundle has
+                // already refetched the Rain overview; nudge a retry.
+                toast.error(BALANCE_SETTLING_MESSAGE)
                 return
             }
             if (error instanceof SessionKeyGrantRequiredError) {

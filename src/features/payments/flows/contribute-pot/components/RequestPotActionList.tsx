@@ -24,14 +24,14 @@ import { ActionListCard } from '@/components/ActionListCard'
 import { useAuth } from '@/context/authContext'
 import { useWallet } from '@/hooks/wallet/useWallet'
 import { useGeoFilteredPaymentOptions } from '@/hooks/useGeoFilteredPaymentOptions'
-import useKycStatus from '@/hooks/useKycStatus'
+import { useCapabilities } from '@/hooks/useCapabilities'
 import { BankRequestType, useDetermineBankRequestType } from '@/hooks/useDetermineBankRequestType'
 import { ACTION_METHODS, type PaymentMethod } from '@/constants/actionlist.consts'
 import { MIN_BANK_TRANSFER_AMOUNT, validateMinimumAmount } from '@/constants/payment.consts'
 import { useAppDispatch } from '@/redux/hooks'
 import { setupActions } from '@/redux/slices/setup-slice'
 import { EInviteType } from '@/services/services.types'
-import { saveRedirectUrl, saveToLocalStorage } from '@/utils/general.utils'
+import { saveRedirectUrl, saveToLocalStorage, toInviteCode } from '@/utils/general.utils'
 import SendWithPeanutCta from '@/features/payments/shared/components/SendWithPeanutCta'
 
 interface RequestPotActionListProps {
@@ -58,8 +58,10 @@ export function RequestPotActionList({
     const router = useRouter()
     const dispatch = useAppDispatch()
     const { user } = useAuth()
-    const { hasSufficientSpendableBalance: hasSufficientBalance, isFetchingBalance } = useWallet()
-    const { isUserMantecaKycApproved } = useKycStatus()
+    const { hasSufficientSpendableBalance: hasSufficientBalance, isFetchingSpendableBalance } = useWallet()
+    // MIGRATION-REVIEW: mercadopago/pix are QR `pay` methods over Manteca. Old gate was
+    // `isUserMantecaKycApproved`; mapped to canDo('pay', { provider: 'manteca' }) (operation-specific).
+    const isMantecaPayEnabled = useCapabilities().canDo('pay', { provider: 'manteca' })
     const { requestType } = useDetermineBankRequestType(recipientUserId ?? '')
 
     const [showMinAmountError, setShowMinAmountError] = useState(false)
@@ -78,9 +80,12 @@ export function RequestPotActionList({
     // only show insufficient balance after balance has loaded to avoid flash
     const userHasSufficientPeanutBalance = useMemo(() => {
         if (!user || !usdAmount) return false
-        if (isFetchingBalance) return true // assume sufficient while loading to avoid flash
+        // wait on BOTH smart + Rain overview (spendable) — using the smart-only
+        // flag would gate on a partial balance and flash a false "insufficient"
+        // for split-funds users during the Rain-overview load window.
+        if (isFetchingSpendableBalance) return true // assume sufficient while loading to avoid flash
         return hasSufficientBalance(usdAmount)
-    }, [user, usdAmount, hasSufficientBalance, isFetchingBalance])
+    }, [user, usdAmount, hasSufficientBalance, isFetchingSpendableBalance])
 
     // filter and sort payment methods
     const { filteredMethods: sortedMethods, isLoading: isGeoLoading } = useGeoFilteredPaymentOptions({
@@ -88,7 +93,7 @@ export function RequestPotActionList({
         isMethodUnavailable: (method) =>
             method.soon ||
             (method.id === 'bank' && requiresVerification) ||
-            (['mercadopago', 'pix'].includes(method.id) && !isUserMantecaKycApproved),
+            (['mercadopago', 'pix'].includes(method.id) && !isMantecaPayEnabled),
         methods: ACTION_METHODS,
     })
 
@@ -131,7 +136,7 @@ export function RequestPotActionList({
                 } else {
                     const redirectUri = encodeURIComponent('/add-money')
                     if (recipientUsername) {
-                        const inviteCode = `${recipientUsername.toUpperCase()}INVITESYOU`
+                        const inviteCode = toInviteCode(recipientUsername)
                         dispatch(setupActions.setInviteCode(inviteCode))
                         dispatch(setupActions.setInviteType(EInviteType.PAYMENT_LINK))
                         router.push(`/invite?code=${inviteCode}&redirect_uri=${redirectUri}`)
@@ -168,7 +173,7 @@ export function RequestPotActionList({
             <div className="space-y-2">
                 {sortedMethods.map((method) => {
                     let methodRequiresVerification = method.id === 'bank' && requiresVerification
-                    if (!isUserMantecaKycApproved && ['mercadopago', 'pix'].includes(method.id)) {
+                    if (!isMantecaPayEnabled && ['mercadopago', 'pix'].includes(method.id)) {
                         methodRequiresVerification = true
                     }
 

@@ -3,10 +3,10 @@ import { useEffect, useState } from 'react'
 import posthog from 'posthog-js'
 import { ANALYTICS_EVENTS, MODAL_TYPES } from '@/constants/analytics.consts'
 import Image from 'next/image'
-import { PEANUT_LOGO_BLACK, PEANUTMAN_LOGO } from '@/assets'
+import { PEANUT_LOGO_BLACK, PEANUTMAN } from '@/assets'
 import Modal from '../Modal'
 import { Button } from '@/components/0_Bruddle/Button'
-import chillPeanutAnim from '@/animations/GIF_ALPHA_BACKGORUND/512X512_ALPHA_GIF_konradurban_01.gif'
+import { PeanutWhistling } from '@/assets/mascot'
 
 const NoMoreJailModal = () => {
     const [isOpen, setisOpen] = useState(false)
@@ -55,7 +55,7 @@ const NoMoreJailModal = () => {
                     <Button className="w-full" shadowSize="4" variant="purple" onClick={onClose}>
                         <div>Start using</div>
                         <div className="flex items-center gap-1">
-                            <Image src={PEANUTMAN_LOGO} alt="Peanut Logo" className="size-5" />
+                            <Image src={PEANUTMAN} alt="Peanut Logo" className="size-5" />
                             <Image src={PEANUT_LOGO_BLACK} alt="Peanut Logo" />
                         </div>
                     </Button>
@@ -65,7 +65,7 @@ const NoMoreJailModal = () => {
             {/* Peanutman animation */}
             <div className="absolute left-0 top-7 flex w-full justify-center" style={{ transform: 'translateY(-80%)' }}>
                 <div className="relative h-42 w-[90%] md:h-52">
-                    <Image src={chillPeanutAnim.src} alt="Peanut Man" className="object-contain" fill />
+                    <Image src={PeanutWhistling.src} unoptimized alt="Peanut Man" className="object-contain" fill />
                 </div>
             </div>
         </Modal>

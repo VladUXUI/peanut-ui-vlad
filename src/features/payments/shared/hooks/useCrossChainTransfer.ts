@@ -44,7 +44,8 @@ import {
     type BridgeCommitResponse,
     type BridgeStatusResponse,
 } from '@/services/rhino-bridge'
-import { evmChainIdToRhinoName } from '@/constants/rhino.consts'
+import { chainIdToRhinoName } from '@/constants/rhino.consts'
+import { NON_EVM_WITHDRAW_CHAINS } from '@/constants/chainRegistry.consts'
 import { areEvmAddressesEqual, getTokenSymbol } from '@/utils/general.utils'
 
 /** Tokens Rhino's SDA primitive accepts as `tokenOut`. Anything else routes
@@ -80,8 +81,13 @@ export interface CrossChainSourceInfo {
 }
 
 export interface CrossChainDestinationInfo {
-    recipientAddress: Address
-    tokenAddress: Address
+    /** 0x for EVM destinations, base58 for Solana/Tron. Only forwarded to the
+     *  backend/Rhino — cross-chain tx construction never uses it (the user's
+     *  tx is an ERC20 transfer to the SDA on Arbitrum). The same-chain path
+     *  narrows it back to an EVM Address (non-EVM can never be same-chain). */
+    recipientAddress: string
+    /** 0x for EVM tokens, base58 mint / TRC20 for non-EVM destinations. */
+    tokenAddress: string
     tokenAmount: string
     tokenDecimals: number
     tokenType: number
@@ -148,13 +154,19 @@ interface CalculateInput {
     skipGasEstimate?: boolean
 }
 
-function inferTokenSymbol(chainId: string, tokenAddress: Address): RhinoSupportedToken | undefined {
+function inferTokenSymbol(chainId: string, tokenAddress: string): RhinoSupportedToken | undefined {
+    // Non-EVM destinations resolve from their synthetic chain records —
+    // token-details.json only knows EVM chains.
+    const nonEvm = NON_EVM_WITHDRAW_CHAINS[String(chainId).toLowerCase()]
+    if (nonEvm) {
+        return nonEvm.tokens.find((t) => t.address.toLowerCase() === tokenAddress.toLowerCase())?.symbol.toUpperCase()
+    }
     // Whatever the curated FE list calls the token (USDC, USDT, ETH, WETH, …);
     // backend forwards it to Rhino, which validates against its own per-route
     // supported-tokens map. Native ETH on EVM uses the SAME 'ETH' symbol —
     // address differs by chain (proxy 0xeee… or zero), but Rhino keys on the
     // symbol.
-    return getTokenSymbol(tokenAddress, chainId)?.toUpperCase()
+    return getTokenSymbol(tokenAddress as Address, chainId)?.toUpperCase()
 }
 
 export function useCrossChainTransfer(): UseCrossChainTransferReturn {
@@ -261,8 +273,8 @@ export function useCrossChainTransfer(): UseCrossChainTransferReturn {
                     return
                 }
 
-                const sourceRhinoChain = evmChainIdToRhinoName(source.chainId)
-                const destRhinoChain = evmChainIdToRhinoName(destination.chainId)
+                const sourceRhinoChain = chainIdToRhinoName(source.chainId)
+                const destRhinoChain = chainIdToRhinoName(destination.chainId)
                 if (!sourceRhinoChain || !destRhinoChain) {
                     throw new Error(
                         `Unsupported Rhino chain mapping (src=${source.chainId} dest=${destination.chainId})`
@@ -303,25 +315,30 @@ export function useCrossChainTransfer(): UseCrossChainTransferReturn {
                     return
                 }
 
-                // Run preview + provision in parallel — they don't depend on each other.
-                const [preview, sda] = await Promise.all([
-                    previewSdaTransfer({
-                        chainIn: sourceRhinoChain,
-                        chainOut: destRhinoChain,
-                        token: tokenSymbol,
-                        amount: destination.tokenAmount,
-                        mode: 'receive', // UI always asks "merchant gets X" — user pays X + fee
-                    }),
-                    provisionSdaTransfer({
-                        context,
-                        contextId,
-                        depositChain: sourceRhinoChain,
-                        destinationChain: destRhinoChain,
-                        destinationAddress: destination.recipientAddress,
-                        tokenOut: tokenSymbol,
-                        senderPeanutWalletAddress,
-                    }),
-                ])
+                // Preview first, then provision — provision now carries the quote
+                // economics (feeUsd / payAmount / receiveAmount) so the backend can
+                // persist them onto the charge and book the FEE ledger entry at
+                // settlement (PRINCIPAL + FEE = real on-chain debit). Sequential
+                // because provision depends on preview's numbers.
+                const preview = await previewSdaTransfer({
+                    chainIn: sourceRhinoChain,
+                    chainOut: destRhinoChain,
+                    token: tokenSymbol,
+                    amount: destination.tokenAmount,
+                    mode: 'receive', // UI always asks "merchant gets X" — user pays X + fee
+                })
+                const sda = await provisionSdaTransfer({
+                    context,
+                    contextId,
+                    depositChain: sourceRhinoChain,
+                    destinationChain: destRhinoChain,
+                    destinationAddress: destination.recipientAddress,
+                    tokenOut: tokenSymbol,
+                    senderPeanutWalletAddress,
+                    feeUsd: preview.feeUsd,
+                    payAmount: preview.payAmount,
+                    receiveAmount: preview.receiveAmount,
+                })
 
                 applyRhinoResult({
                     preview,
@@ -519,8 +536,10 @@ async function buildSameChainTx({
     skipGasEstimate,
 }: SameChainParams): Promise<void> {
     const tx = prepareRequestLinkFulfillmentTransaction({
-        recipientAddress: destination.recipientAddress,
-        tokenAddress: destination.tokenAddress,
+        // same-chain is EVM-only by construction (source is the Arbitrum
+        // Peanut wallet; non-EVM destinations are always cross-chain)
+        recipientAddress: destination.recipientAddress as Address,
+        tokenAddress: destination.tokenAddress as Address,
         tokenAmount: destination.tokenAmount,
         tokenDecimals: destination.tokenDecimals,
         tokenType: destination.tokenType as peanutInterfaces.EPeanutLinkType,

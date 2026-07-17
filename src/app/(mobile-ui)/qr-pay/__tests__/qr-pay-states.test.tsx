@@ -8,9 +8,21 @@
  * per-test via mockReturnValue / mockImplementation.
  */
 import React from 'react'
+import posthog from 'posthog-js'
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { parseUnits } from 'viem'
+import type { RailCapability, CapabilityRestriction } from '@/types/capabilities'
+
+// Test-local subsets — only the fields the qr-pay page actually reads from each
+// fixture. Mirroring the full RailCapability/CapabilityRestriction types here
+// would force every fixture to supply method/country/currency + a non-nullable
+// reason message even when the page never touches them.
+type TestRail = Pick<RailCapability, 'id' | 'provider' | 'status' | 'operations'> & {
+    reason?: { userMessage: string | null }
+    resolved?: RailCapability['resolved']
+}
+type TestRestriction = { code: string; affectedRailIds: string[]; userMessage?: string | null }
 
 // ---------- module-level mocks (must be before imports that depend on them) ----------
 
@@ -69,22 +81,27 @@ jest.mock('@/assets/payment-apps', () => ({
     PIX: '/pix.png',
 }))
 
-jest.mock('@/assets', () => ({
-    PeanutGuyGIF: '/peanut-guy.gif',
+// The page imports PeanutThinking from @/assets/mascot and STAR_STRAIGHT_ICON
+// from @/assets/icons directly — mock those paths, not the @/assets barrel, and
+// keep sibling exports (e.g. PEANUTMAN, ETHEREUM_ICON used by QRScanner) intact.
+jest.mock('@/assets/mascot', () => ({
+    ...jest.requireActual('@/assets/mascot'),
+    PeanutThinking: '/peanut-guy.gif',
+}))
+
+jest.mock('@/assets/icons', () => ({
+    ...jest.requireActual('@/assets/icons'),
     STAR_STRAIGHT_ICON: '/star.png',
 }))
 
 // ---------- hooks & services ----------
 
-const mockUseQrKycGate = jest.fn()
-jest.mock('@/hooks/useQrKycGate', () => ({
-    QrKycState: {
-        LOADING: 'loading',
-        PROCEED_TO_PAY: 'proceed_to_pay',
-        REQUIRES_IDENTITY_VERIFICATION: 'requires_identity_verification',
-        IDENTITY_VERIFICATION_IN_PROGRESS: 'identity_verification_in_progress',
-    },
-    useQrKycGate: (...args: any[]) => mockUseQrKycGate(...args),
+// The page derives the QR gate inline from useCapabilities() (QrKycState lives in
+// @/constants/kyc.consts — used as the real module here). Each gate-state test configures
+// the capability fixture via setCapabilitiesGate() below.
+const mockUseCapabilities = jest.fn()
+jest.mock('@/hooks/useCapabilities', () => ({
+    useCapabilities: () => mockUseCapabilities(),
 }))
 
 const mockUseAuth = jest.fn()
@@ -122,7 +139,10 @@ jest.mock('@/hooks/useRainCardOverview', () => ({
 }))
 
 jest.mock('@/utils/balance.utils', () => ({
-    rainSpendingPowerToWei: jest.fn(() => 0n),
+    // keep the real isAmountWithinBalance / messages so the gate is genuinely
+    // exercised; only stub the Rain widening helper.
+    ...jest.requireActual('@/utils/balance.utils'),
+    rainCentsToUsdcUnits: jest.fn(() => 0n),
 }))
 
 const mockUseTransactionDetailsDrawer = jest.fn()
@@ -141,7 +161,6 @@ jest.mock('@/components/TransactionDetails/TransactionDetailsDrawer', () => ({
 const mockMantecaApi = {
     initiateQrPayment: jest.fn(),
     completeQrPaymentWithSignedTx: jest.fn(),
-    claimPerk: jest.fn(),
 }
 jest.mock('@/services/manteca', () => ({
     mantecaApi: mockMantecaApi,
@@ -149,6 +168,10 @@ jest.mock('@/services/manteca', () => ({
 
 jest.mock('@/app/actions/currency', () => ({
     getCurrencyPrice: jest.fn(() => Promise.resolve({ sell: 1200, buy: 1250 })),
+}))
+
+jest.mock('@/hooks/useCardMarkupRate', () => ({
+    useCardMarkupRate: jest.fn(() => ({ data: null })),
 }))
 
 jest.mock('@/app/actions/increase-limits', () => ({
@@ -217,12 +240,6 @@ jest.mock('@/features/limits/utils', () => ({
     isBrUserEligibleForLimitIncrease: jest.fn(() => false),
 }))
 
-const mockUseKycStatus = jest.fn()
-jest.mock('@/hooks/useKycStatus', () => ({
-    __esModule: true,
-    default: () => mockUseKycStatus(),
-}))
-
 jest.mock('@/hooks/useSumsubActionFlow', () => ({
     useSumsubActionFlow: () => ({
         showWrapper: false,
@@ -269,6 +286,7 @@ jest.mock('@/utils/perk.utils', () => ({
 
 jest.mock('@/utils/qr-payment.utils', () => ({
     calculateSavingsInCents: jest.fn(() => 0),
+    hasCardMarkupComparison: jest.fn(() => false),
     isArgentinaMantecaQrPayment: jest.fn(() => false),
     getSavingsMessage: jest.fn(() => ''),
 }))
@@ -306,6 +324,11 @@ jest.mock('@/components/Global/AmountInput', () => ({
 jest.mock('@/components/Global/PeanutLoading', () => ({
     __esModule: true,
     default: (props: any) => <div data-testid="peanut-loading">{props.message && <span>{props.message}</span>}</div>,
+}))
+
+jest.mock('@/components/Global/PeanutLoading/CyclingLoading', () => ({
+    __esModule: true,
+    default: () => <div data-testid="cycling-loading" />,
 }))
 
 jest.mock('@/components/Global/NavHeader', () => ({
@@ -422,9 +445,70 @@ function createQueryClient() {
     })
 }
 
+// Build a useCapabilities() return value that drives the page's inline QR gate to a
+// target state. Mirrors the real hook's helper surface (only the bits the page reads).
+type GateState =
+    | 'loading'
+    | 'proceed_to_pay'
+    | 'requires_identity_verification'
+    | 'identity_verification_in_progress'
+    | 'provider_rejection_fixable'
+    | 'provider_rejection_blocked'
+
+const MANTECA_RAIL_ID = 'manteca.pix_br'
+// The capability-contract restriction code emitted by the backend resolver — NOT the legacy
+// provider-metadata constant. The page's pool-fallback branch must match THIS value.
+const US_RESTRICTION_CODE = 'manteca_us_nationality'
+
+function capabilitiesForGate(state: GateState, opts: { userMessage?: string | null; usRestricted?: boolean } = {}) {
+    const { userMessage = null, usRestricted = false } = opts
+    // Map the target gate state to a single Manteca rail + (optional) restriction.
+    let rails: TestRail[] = []
+    let restrictions: TestRestriction[] = []
+    let payEnabled = false
+    switch (state) {
+        case 'proceed_to_pay':
+            payEnabled = true
+            rails = [{ id: MANTECA_RAIL_ID, provider: 'manteca', status: 'enabled', operations: { pay: 'enabled' } }]
+            break
+        case 'provider_rejection_blocked':
+            rails = [{ id: MANTECA_RAIL_ID, provider: 'manteca', status: 'blocked', reason: { userMessage } }]
+            if (usRestricted) {
+                restrictions = [{ code: US_RESTRICTION_CODE, affectedRailIds: [MANTECA_RAIL_ID], userMessage }]
+            }
+            break
+        case 'provider_rejection_fixable':
+            rails = [{ id: MANTECA_RAIL_ID, provider: 'manteca', status: 'requires-info', reason: { userMessage } }]
+            break
+        case 'identity_verification_in_progress':
+            rails = [{ id: MANTECA_RAIL_ID, provider: 'manteca', status: 'pending' }]
+            break
+        case 'requires_identity_verification':
+        case 'loading':
+        default:
+            rails = []
+            break
+    }
+    return {
+        rails,
+        restrictions,
+        isLoading: state === 'loading',
+        isKycApproved: payEnabled,
+        canDo: (_op: string, o?: { provider?: string }) =>
+            payEnabled && (o?.provider === undefined || o.provider === 'manteca'),
+        railsForProvider: (provider: string) => rails.filter((r) => r.provider === provider),
+        nextActions: [],
+        restrictionForRail: (railId: string) => restrictions.find((r) => r.affectedRailIds.includes(railId)),
+    }
+}
+
+function setCapabilitiesGate(state: GateState, opts: { userMessage?: string | null; usRestricted?: boolean } = {}) {
+    mockUseCapabilities.mockReturnValue(capabilitiesForGate(state, opts))
+}
+
 // Loading state context provider
 const LoadingStateProvider = ({ children }: { children: React.ReactNode }) => {
-    const loadingStateContext = require('@/context').loadingStateContext
+    const loadingStateContext = require('@/context/loadingStates.context').loadingStateContext
     const [loadingState, setLoadingState] = React.useState('Idle')
     const isLoading = loadingState !== 'Idle'
     return (
@@ -434,9 +518,10 @@ const LoadingStateProvider = ({ children }: { children: React.ReactNode }) => {
     )
 }
 
-// We need to mock the context module itself since it's imported via { loadingStateContext }
+// We need to mock the context module itself (specific file, not the barrel — the page
+// imports from '@/context/loadingStates.context' per the no-barrel rule)
 const mockSetLoadingState = jest.fn()
-jest.mock('@/context', () => ({
+jest.mock('@/context/loadingStates.context', () => ({
     loadingStateContext: React.createContext({
         loadingState: 'Idle' as string,
         setLoadingState: (s: string) => {},
@@ -447,7 +532,7 @@ jest.mock('@/context', () => ({
 function renderQrPay(params: Record<string, string> = {}) {
     setSearchParams(params)
     const queryClient = createQueryClient()
-    const { loadingStateContext } = require('@/context')
+    const { loadingStateContext } = require('@/context/loadingStates.context')
 
     const LoadingProvider = ({ children }: { children: React.ReactNode }) => {
         const [loadingState, setLoadingState] = React.useState<string>('Idle')
@@ -471,10 +556,7 @@ function renderQrPay(params: Record<string, string> = {}) {
 // ---------- default mock values ----------
 
 function applyDefaults() {
-    mockUseQrKycGate.mockReturnValue({
-        kycGateState: 'proceed_to_pay',
-        shouldBlockPay: false,
-    })
+    setCapabilitiesGate('proceed_to_pay')
 
     mockUseAuth.mockReturnValue({
         user: { user: { username: 'test-user' } },
@@ -484,6 +566,8 @@ function applyDefaults() {
 
     mockUseWallet.mockReturnValue({
         balance: parseUnits('100', 6), // $100 USDC
+        spendableBalance: parseUnits('100', 6),
+        hasSufficientSpendableBalance: () => true, // affordable by default
         sendMoney: jest.fn(),
     })
 
@@ -498,10 +582,6 @@ function applyDefaults() {
         isBlocking: false,
         isWarning: false,
         currency: 'USD',
-    })
-
-    mockUseKycStatus.mockReturnValue({
-        isUserMantecaKycApproved: true,
     })
 
     mockIsPaymentProcessorQR.mockReturnValue(true)
@@ -545,15 +625,6 @@ function applyDefaults() {
         },
     })
 
-    mockMantecaApi.claimPerk.mockResolvedValue({
-        success: true,
-        perk: {
-            amountSponsored: 0.5,
-            discountPercentage: 5,
-            txHash: '0xabc',
-        },
-    })
-
     mockSignSpend.mockResolvedValue({
         strategy: 'smart-only',
         signedUserOp: {
@@ -593,42 +664,87 @@ beforeEach(() => {
 // ============================================================
 describe('GROUP 1: Loading & KYC Gate', () => {
     test('KYC loading shows PeanutLoading', () => {
-        mockUseQrKycGate.mockReturnValue({
-            kycGateState: 'loading',
-            shouldBlockPay: true,
-        })
+        setCapabilitiesGate('loading')
 
         renderQrPay({ qrCode: 'mercadopago://pay?id=123', type: 'MERCADO_PAGO', t: '1' })
         expect(screen.getByTestId('peanut-loading')).toBeInTheDocument()
     })
 
     test('KYC requires verification shows ActionModal with verify button', () => {
-        mockUseQrKycGate.mockReturnValue({
-            kycGateState: 'requires_identity_verification',
-            shouldBlockPay: true,
-        })
+        setCapabilitiesGate('requires_identity_verification')
 
         renderQrPay({ qrCode: 'mercadopago://pay?id=123', type: 'MERCADO_PAGO', t: '1' })
 
         const modal = screen.getByTestId('action-modal')
         expect(modal).toBeInTheDocument()
-        expect(screen.getByText('Verify your identity to continue')).toBeInTheDocument()
-        expect(screen.getByText('Verify now')).toBeInTheDocument()
+        expect(screen.getByText('Unlock QR payments')).toBeInTheDocument()
+        expect(screen.getByText('Unlock now')).toBeInTheDocument()
     })
 
     test('KYC verification in progress shows ActionModal with continue button', () => {
-        mockUseQrKycGate.mockReturnValue({
-            kycGateState: 'identity_verification_in_progress',
-            shouldBlockPay: true,
-        })
+        setCapabilitiesGate('identity_verification_in_progress')
 
         renderQrPay({ qrCode: 'mercadopago://pay?id=123', type: 'MERCADO_PAGO', t: '1' })
 
         const modal = screen.getByTestId('action-modal')
         expect(modal).toBeInTheDocument()
-        expect(screen.getByText('Complete your verification')).toBeInTheDocument()
-        expect(screen.getByText('Continue verification')).toBeInTheDocument()
+        expect(screen.getByText('Almost there')).toBeInTheDocument()
+        expect(screen.getByText('Continue')).toBeInTheDocument()
     })
+
+    test('Manteca blocked rejection shows unavailable modal with rail reason message', () => {
+        setCapabilitiesGate('provider_rejection_blocked', { userMessage: 'Contact support to continue.' })
+
+        renderQrPay({ qrCode: 'mercadopago://pay?id=123', type: 'MERCADO_PAGO', t: '1' })
+
+        expect(screen.getByText('QR payments are not available')).toBeInTheDocument()
+        expect(screen.getByText('Contact support to continue.')).toBeInTheDocument()
+    })
+
+    test('provide-email verdict maps to the unavailable modal, never the document-upload flow', () => {
+        // a fixable verdict whose only fix is adding an email must not open
+        // the Sumsub upload flow (this surface has no email form) — same
+        // mapping rule as deriveProviderRejection
+        mockUseCapabilities.mockReturnValue({
+            ...capabilitiesForGate('provider_rejection_fixable', { userMessage: 'Add your email to continue.' }),
+            railsForProvider: () => [
+                {
+                    id: MANTECA_RAIL_ID,
+                    provider: 'manteca',
+                    status: 'blocked',
+                    resolved: {
+                        status: 'fixable',
+                        blocking: {
+                            code: 'email_required',
+                            userMessage: 'Add your email to continue.',
+                            selfHealable: true,
+                            selfHealKind: 'provide-email',
+                        },
+                    },
+                } as TestRail,
+            ],
+        })
+
+        renderQrPay({ qrCode: 'mercadopago://pay?id=123', type: 'MERCADO_PAGO', t: '1' })
+
+        expect(screen.getByText('QR payments are not available')).toBeInTheDocument()
+        expect(screen.queryByText('Upload document')).not.toBeInTheDocument()
+    })
+
+    test('Manteca fixable rejection shows updated-document modal', () => {
+        setCapabilitiesGate('provider_rejection_fixable', { userMessage: 'Upload a clearer ID.' })
+
+        renderQrPay({ qrCode: 'mercadopago://pay?id=123', type: 'MERCADO_PAGO', t: '1' })
+
+        expect(screen.getByText('We need an updated document')).toBeInTheDocument()
+        expect(screen.getByText('Upload document')).toBeInTheDocument()
+    })
+
+    // The prior "US-nationality restriction falls through to pay" test was deleted
+    // 2026-05-28: the BE resolver now codifies the compliance ruling directly —
+    // Sumsub-approved US-restricted users get rail status:'enabled' with
+    // operations.pay='enabled', so `canDo('pay')` returns true and the existing
+    // PROCEED_TO_PAY tests cover this path. No FE special-case to test anymore.
 
     test('KYC passed but payment data still loading shows PeanutLoading', async () => {
         // KYC passed, but Manteca payment lock hasn't loaded yet
@@ -693,14 +809,14 @@ describe('GROUP 2: Payment Form States', () => {
         expect(screen.getByRole('button', { name: 'Pay' })).toBeInTheDocument()
     })
 
-    test.skip('Insufficient balance shows pay button disabled + error', async () => {
-        // SKIP 2026-04-24: feat/card-ui merge surfaced post-merge balance
-        // path mismatch in qr-pay state tests. Mock signature for useWallet
-        // drifted vs new spendable-balance shape. FOLLOW-UP: rewrite or delete
-        // these state tests after the card-ui apply flow stabilises.
-        // Set balance to $5 but payment needs $18.4
+    test('Insufficient balance shows pay button disabled + error', async () => {
+        // Payment needs ~$18.4 but the displayed spendable is only $5, so the gate
+        // (hasSufficientSpendableBalance) returns false. Revived from skip once the
+        // gate moved onto the shared hook predicate (the original mock-shape drift).
         mockUseWallet.mockReturnValue({
             balance: parseUnits('5', 6),
+            spendableBalance: parseUnits('5', 6),
+            hasSufficientSpendableBalance: () => false,
             sendMoney: jest.fn(),
         })
 
@@ -834,11 +950,11 @@ describe('GROUP 3: Processing States', () => {
             fireEvent.click(payButton)
         })
 
-        // After clicking pay, loading state should trigger PeanutLoading
+        // After clicking pay, loading state should trigger PeanutLoading or CyclingLoading
         // (signSpend resolves, then completeQrPayment hangs)
         await waitFor(() => {
-            // Component is in loading state - either shows PeanutLoading or loading button text
-            const loadingEl = screen.queryByTestId('peanut-loading')
+            // Component is in loading state - either shows a loading variant or loading button text
+            const loadingEl = screen.queryByTestId('peanut-loading') ?? screen.queryByTestId('cycling-loading')
             const loadingButton = screen.queryByText('Loading...')
             expect(loadingEl || loadingButton).toBeTruthy()
         })
@@ -1018,6 +1134,56 @@ describe('GROUP 4: Success States', () => {
         jest.useRealTimers()
     })
 
+    // Regression: the perk is already claimed server-side during QR-payment
+    // processing, and the QR response carries the sponsored amount. The
+    // hold-to-claim gesture must report that reward directly — it must NOT make
+    // a second /perks/claim round-trip (that endpoint now requires a usageId the
+    // client never has, so the old call always 400'd and surfaced a false
+    // "reward is being processed" error even though the reward had landed).
+    test('Perk claim reports the reward from the QR response, no /perks/claim round-trip, no error', async () => {
+        jest.useFakeTimers()
+
+        // BE sends sponsoredUsd; the page maps it to amountSponsored on load.
+        await completeMantecaPayment({
+            perk: {
+                eligible: true,
+                discountPercentage: 5,
+                sponsoredUsd: 0.5,
+            },
+        })
+
+        await waitFor(() => {
+            expect(screen.getByRole('button', { name: /Claim Reward/i })).toBeInTheDocument()
+        })
+
+        const claimButton = screen.getByRole('button', { name: /Claim Reward/i })
+        await act(async () => {
+            fireEvent.pointerDown(claimButton)
+        })
+        // Advance past the hold duration to fire the claim.
+        await act(async () => {
+            jest.advanceTimersByTime(1600)
+        })
+
+        await waitFor(() => {
+            expect(screen.getByText('Go to Home')).toBeInTheDocument()
+        })
+
+        // Reward reported from the QR response (sponsoredUsd → amount_usd).
+        expect(posthog.capture).toHaveBeenCalledWith('reward_claimed', {
+            amount_usd: 0.5,
+            discount_pct: 5,
+        })
+
+        // The old broken round-trip surfaced this false error — it must not appear.
+        expect(screen.queryByText(/reward is being processed/i)).not.toBeInTheDocument()
+
+        // The redundant client claim method is gone entirely.
+        expect('claimPerk' in mockMantecaApi).toBe(false)
+
+        jest.useRealTimers()
+    })
+
     test('PIX success shows PIX icon', async () => {
         renderQrPay({ qrCode: 'pix://payment?id=123', type: 'PIX', t: '1' })
 
@@ -1062,12 +1228,12 @@ describe('GROUP 4: Success States', () => {
 
     test('Argentina QR3 success shows savings message', async () => {
         const {
-            isArgentinaMantecaQrPayment,
+            hasCardMarkupComparison,
             calculateSavingsInCents,
             getSavingsMessage,
         } = require('@/utils/qr-payment.utils')
 
-        isArgentinaMantecaQrPayment.mockReturnValue(true)
+        hasCardMarkupComparison.mockReturnValue(true)
         calculateSavingsInCents.mockReturnValue(150)
         getSavingsMessage.mockReturnValue('You saved $1.50 vs card!')
 
@@ -1093,6 +1259,16 @@ describe('GROUP 5: Error States', () => {
 
         await waitFor(() => {
             expect(screen.getByText(/could not decode/i)).toBeInTheDocument()
+        })
+    })
+
+    test('Below-minimum Pix charge shows the Pix minimum-amount error', async () => {
+        mockMantecaApi.initiateQrPayment.mockRejectedValue(new Error('PIX_MIN_AMOUNT'))
+
+        renderQrPay({ qrCode: 'pix://payment?id=123', type: 'PIX', t: '1' })
+
+        await waitFor(() => {
+            expect(screen.getByText(/BRL minimum for Pix payments/i)).toBeInTheDocument()
         })
     })
 

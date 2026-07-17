@@ -1,8 +1,12 @@
 'use client'
 
+import Image from 'next/image'
+import { type ReactNode } from 'react'
 import { PaymentInfoRow } from '@/components/Payment/PaymentInfoRow'
-import { type TransactionDetails } from '@/components/TransactionDetails/transactionTransformer'
+import { type DisputeStatus, type TransactionDetails } from '@/components/TransactionDetails/transactionTransformer'
 import { friendlyDeclineReason } from '@/utils/cardDeclineReason'
+import { getFlagUrl } from '@/constants/countryCurrencyMapping'
+import { extractMerchantIso2 } from '@/components/TransactionDetails/transaction-details.utils'
 
 /** Strings from Rain's sandbox arrive whitespace-padded ("  ", " - ") and
  *  legacy intents in the DB pre-date the backend cleanField pass — treat any
@@ -21,6 +25,30 @@ function parseCents(value: string | null | undefined): number | null {
     if (value == null) return null
     const n = Number(value)
     return Number.isFinite(n) ? n : null
+}
+
+/**
+ * Friendly copy for the dispute status row. The drawer shows ONE row labeled
+ * "Dispute" with the status-mapped text. Keep terminal-state copy actionable:
+ * "Resolved by merchant refund" / "Accepted (refund issued)" both signal that
+ * money has been returned (or is being returned), which is the user's actual
+ * concern at that point.
+ */
+export function disputeStatusLabel(status: DisputeStatus): string {
+    switch (status) {
+        case 'pending':
+            return 'Disputed — Awaiting review'
+        case 'inReview':
+            return 'Disputed — In review'
+        case 'accepted':
+            return 'Disputed — Accepted (refund issued)'
+        case 'rejected':
+            return 'Disputed — Rejected'
+        case 'canceled':
+            return 'Disputed — Cancelled'
+        case 'resolvedByMerchant':
+            return 'Disputed — Resolved by merchant refund'
+    }
 }
 
 /**
@@ -45,8 +73,7 @@ export function hasCardPaymentRowsContent(transaction: TransactionDetails): bool
     const card = transaction.extraDataForDrawer?.cardPayment
     if (!card) return false
 
-    if (nonBlank(card.merchantCategory)) return true
-    if (nonBlank(card.merchantCity) || nonBlank(card.merchantCountry)) return true
+    if (extractMerchantIso2(card.merchantCountry)) return true
     if (card.settlementAdjusted && parseCents(card.authAmount) != null) return true
     // declineCategory is BE-controlled (one of 3 enum literals) — no
     // whitespace risk. declineReason is Rain's free-form prose — gate it
@@ -62,6 +89,7 @@ export function hasCardPaymentRowsContent(transaction: TransactionDetails): bool
     if (card.cancellationReason === 'auth_reversed' || card.cancellationReason === 'auth_expired_uncaptured') {
         return true
     }
+    if (card.dispute) return true
     return false
 }
 
@@ -93,20 +121,31 @@ export function CardPaymentRows({
 
     // Compose the visible sub-rows in order, then mark the final one as
     // border-suppressed if this whole slot is also the receipt's last.
-    const subRows: { label: string; value: string; key: string }[] = []
+    const subRows: { label: string; value: ReactNode; key: string }[] = []
 
-    const categoryClean = nonBlank(card.merchantCategory)
-    if (categoryClean) {
-        subRows.push({ key: 'category', label: 'Category', value: categoryClean })
-    }
+    // Merchant category was dropped — the MCC label adds noise without
+    // signal for non-finance users ("Eating Places, Restaurants" tells them
+    // nothing they don't already know from the merchant name).
 
-    const cityClean = nonBlank(card.merchantCity)
-    const countryClean = nonBlank(card.merchantCountry)
-    if (cityClean || countryClean) {
+    // Location renders ONLY when we can recover a 2-letter country code.
+    // Country flag replaces the prior "City, COUNTRY" text — it's denser
+    // and recognisable at a glance; the merchant name on the receipt head
+    // carries the city information for users who want it.
+    const iso2 = extractMerchantIso2(card.merchantCountry)
+    if (iso2) {
         subRows.push({
             key: 'location',
             label: 'Location',
-            value: [cityClean, countryClean].filter(Boolean).join(', '),
+            value: (
+                <Image
+                    src={getFlagUrl(iso2)}
+                    alt={`${iso2.toUpperCase()} flag`}
+                    width={80}
+                    height={80}
+                    className="h-5 w-5 rounded-full object-cover object-center shadow-sm"
+                    loading="lazy"
+                />
+            ),
         })
     }
 
@@ -184,12 +223,38 @@ export function CardPaymentRows({
         card.cancellationReason === 'auto_closed' ||
         card.cancellationReason === 'auth_reversed' ||
         card.cancellationReason === 'auth_expired_uncaptured'
-    if (transaction.status === 'pending' && !card.isRefund && !hasCancellationNote) {
+    // Active disputes flip the pill to pending too (see transactionTransformer),
+    // but the dispute row IS the status — the spend already settled, so
+    // "Authorized, awaiting settlement" is a lie next to "Disputed — In review".
+    const hasActiveDispute = card.dispute?.status === 'pending' || card.dispute?.status === 'inReview'
+    if (transaction.status === 'pending' && !card.isRefund && !hasCancellationNote && !hasActiveDispute) {
         subRows.push({
             key: 'pendingNote',
             label: 'Status',
             value: 'Authorized, awaiting settlement or reversal',
         })
+    }
+
+    // Dispute lifecycle. One row for the status; an additional row when Rain
+    // has requested evidence so the user knows to upload it. Both render
+    // regardless of the spend's status — disputes outlive the spend lifecycle.
+    if (card.dispute) {
+        subRows.push({
+            key: 'disputeStatus',
+            label: 'Dispute',
+            value: disputeStatusLabel(card.dispute.status),
+        })
+        // Rain prompt text is free-form prose; the same nonBlank gate the
+        // decline-reason row uses keeps whitespace-only payloads from
+        // rendering an empty "Evidence requested" row.
+        const evidenceMessage = nonBlank(card.dispute.evidenceRequestedMessage)
+        if (evidenceMessage) {
+            subRows.push({
+                key: 'disputeEvidenceRequest',
+                label: 'Evidence requested',
+                value: evidenceMessage,
+            })
+        }
     }
 
     if (subRows.length === 0) return null

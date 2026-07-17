@@ -1,5 +1,8 @@
 import { validateInviteCode } from '@/app/actions/invites'
 import { serverFetch } from '@/utils/api-fetch'
+import { toInviteCode } from '@/utils/general.utils'
+import { isCapacitor } from '@/utils/capacitor'
+import { enableDemoMode, isDemoInviteCode } from '@/utils/demo'
 import { EInviteType, type PointsInvitesResponse } from './services.types'
 
 export const invitesApi = {
@@ -11,7 +14,10 @@ export const invitesApi = {
         try {
             const response = await serverFetch('/invites/accept', {
                 method: 'POST',
-                body: JSON.stringify({ inviteCode, type, campaignTag }),
+                // Normalize here so hand-typed input (`@alice `, ` Alice`) works no
+                // matter which screen collected it. Legacy ALICEINVITESYOU610 codes
+                // pass through unchanged in meaning — the BE uppercases before parsing.
+                body: JSON.stringify({ inviteCode: toInviteCode(inviteCode), type, campaignTag }),
             })
             if (!response.ok) {
                 return { success: false }
@@ -40,7 +46,11 @@ export const invitesApi = {
 
     validateInviteCode: async (inviteCode: string): Promise<{ success: boolean; username: string }> => {
         try {
-            const res = await validateInviteCode(inviteCode)
+            const res = await validateInviteCode(toInviteCode(inviteCode))
+            // demo code enables demo mode.
+            if (res.data?.success && isCapacitor() && isDemoInviteCode(inviteCode)) {
+                enableDemoMode()
+            }
             return {
                 success: res.data?.success || false,
                 username: res.data?.username || '',

@@ -10,9 +10,9 @@ import SlideToAction from '@/components/Card/SlideToAction'
 import { rainApi } from '@/services/rain'
 import { RAIN_CARD_OVERVIEW_QUERY_KEY, useRainCardOverview } from '@/hooks/useRainCardOverview'
 import { useSignSpendBundle } from '@/hooks/wallet/useSignSpendBundle'
-import { InsufficientSpendableError, SessionKeyGrantRequiredError } from '@/hooks/wallet/useSpendBundle'
+import { InsufficientSpendableError, SessionKeyGrantRequiredError } from '@/hooks/wallet/spendPreflight'
 import { useWallet } from '@/hooks/wallet/useWallet'
-import { rainSpendingPowerToWei } from '@/utils/balance.utils'
+import { rainCentsToUsdcUnits } from '@/utils/balance.utils'
 
 type Mode = 'lock' | 'unlock'
 type Phase = 'prompt' | 'loading' | 'success' | 'error'
@@ -67,9 +67,9 @@ const LockCardModal: FC<Props> = ({ cardId, mode, isOpen, onClose }) => {
                 // smart wallet BEFORE locking so funds stay liquid. The
                 // backend gates the lock on a successful withdrawal — order
                 // is handled there. We only need to deliver the signed body.
-                const spendingPowerWei = rainSpendingPowerToWei(overview?.balance?.spendingPower)
+                const spendingPowerUnits = rainCentsToUsdcUnits(overview?.balance?.spendingPower)
                 let verifiedWithdrawal: import('@/hooks/wallet/useSignSpendBundle').SignedRainWithdrawal | undefined
-                if (spendingPowerWei > 0n) {
+                if (spendingPowerUnits > 0n) {
                     if (!smartWalletAddress) {
                         throw new Error('Wallet not ready — please retry in a moment')
                     }
@@ -78,10 +78,9 @@ const LockCardModal: FC<Props> = ({ cardId, mode, isOpen, onClose }) => {
                     // picks 'collateral-only' and signs a Rain withdrawal
                     // straight to the user's smart wallet (1 passkey tap).
                     const artifact = await signSpend({
-                        requiredUsdcAmount: spendingPowerWei,
+                        requiredUsdcAmount: spendingPowerUnits,
                         recipient: smartWalletAddress as `0x${string}`,
-                        smartBalance: 0n,
-                        rainSpendingPower: spendingPowerWei,
+                        rainSpendingPower: spendingPowerUnits,
                         kind: 'CRYPTO_WITHDRAW',
                     })
                     if (artifact.strategy !== 'collateral-only') {
@@ -112,7 +111,7 @@ const LockCardModal: FC<Props> = ({ cardId, mode, isOpen, onClose }) => {
     }
 
     return (
-        <Modal visible={isOpen} onClose={onClose} classWrap="sm:m-auto sm:self-center self-center m-4 rounded-2xl">
+        <Modal visible={isOpen} onClose={onClose} classWrap="sm:m-auto sm:self-center self-center m-4">
             <div className="p-6">
                 {phase === 'success' ? (
                     <div className="flex flex-col items-center gap-4 text-center">
@@ -121,9 +120,6 @@ const LockCardModal: FC<Props> = ({ cardId, mode, isOpen, onClose }) => {
                         </div>
                         <div className="text-xl font-extrabold">{copy.success}</div>
                         <p className="text-sm text-grey-1">{copy.successBody(mode === 'lock' ? 'unlock' : 'lock')}</p>
-                        <Button variant="purple" shadowSize="4" className="w-full" onClick={onClose}>
-                            Close
-                        </Button>
                     </div>
                 ) : (
                     <div className="flex flex-col items-center gap-4 text-center">
@@ -151,14 +147,6 @@ const LockCardModal: FC<Props> = ({ cardId, mode, isOpen, onClose }) => {
                                 Unlock
                             </Button>
                         )}
-                        <button
-                            type="button"
-                            onClick={onClose}
-                            className="text-black underline"
-                            disabled={phase === 'loading'}
-                        >
-                            Cancel
-                        </button>
                     </div>
                 )}
             </div>

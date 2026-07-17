@@ -1,6 +1,9 @@
 'use client'
 
+import { useRef, useState, type ReactNode } from 'react'
 import { Button } from '@/components/0_Bruddle/Button'
+import ActionModal from '@/components/Global/ActionModal'
+import ErrorAlert from '@/components/Global/ErrorAlert'
 import { Icon } from '@/components/Global/Icons/Icon'
 import { type TransactionDetails } from '@/components/TransactionDetails/transactionTransformer'
 import { isMantecaOnrampEntry, isRequestEntry } from '@/components/TransactionDetails/transaction-predicates'
@@ -37,6 +40,19 @@ export function CancelDepositActions({
     onClose: (() => void) | undefined
 }) {
     const queryClient = useQueryClient()
+    const [error, setError] = useState<string | null>(null)
+    // Cancels are irreversible and the button sits next to the support link —
+    // a real user cancelled a funded deposit while trying to report a problem
+    // (no way to match the wire once cancelled). Every cancel confirms first.
+    const [pendingCancel, setPendingCancel] = useState<{ noun: string; run: () => Promise<void> } | null>(null)
+    // Visibility is separate from pendingCancel so the noun stays rendered
+    // during the modal's fade-out (nulling it mid-fade flashed 'deposit'
+    // over 'request' titles).
+    const [confirmOpen, setConfirmOpen] = useState(false)
+    // Ref, not state: a double-tap on the confirm CTA during the modal's
+    // fade-out lands both clicks before a re-render, so a state guard would
+    // let the cancel fire twice. Refs are synchronous.
+    const isCancelRunning = useRef(false)
     if (!setIsLoading || !onClose) return null
 
     const refetchAndClose = () =>
@@ -47,15 +63,68 @@ export function CancelDepositActions({
 
     const wrapAction = async (run: () => Promise<void>) => {
         setIsLoading(true)
+        setError(null)
         try {
             await run()
             await refetchAndClose()
-        } catch (error) {
-            captureException(error)
-            console.error('Error canceling deposit:', error)
+        } catch (err) {
+            captureException(err)
+            // A cancel that fails silently makes the user believe the deposit is
+            // cancelled when it isn't — surface it instead of only logging.
+            setError("We couldn't cancel this deposit. Please try again or contact support.")
             setIsLoading(false)
         }
     }
+
+    const armCancel = (noun: string, run: () => Promise<void>) => {
+        setPendingCancel({ noun, run })
+        setConfirmOpen(true)
+    }
+
+    const confirmThenRun = async () => {
+        if (!pendingCancel || isCancelRunning.current) return
+        isCancelRunning.current = true
+        setConfirmOpen(false)
+        try {
+            await wrapAction(pendingCancel.run)
+        } finally {
+            isCancelRunning.current = false
+        }
+    }
+
+    // Render the active cancel button (if any) alongside the shared
+    // confirmation modal and any failure message.
+    const withError = (button: ReactNode) => (
+        <div className="flex w-full flex-col gap-2">
+            {button}
+            {error && <ErrorAlert description={error} />}
+            <ActionModal
+                visible={confirmOpen}
+                onClose={() => setConfirmOpen(false)}
+                icon="ban"
+                title={`Cancel this ${pendingCancel?.noun ?? 'deposit'}?`}
+                modalClassName="!z-[9999] pointer-events-auto"
+                description={
+                    <>
+                        This can't be undone. If you already sent the bank transfer, <strong>don't cancel</strong> — a
+                        cancelled deposit can no longer be matched to your account, and the money will be returned to
+                        your bank instead.
+                    </>
+                }
+                modalPanelClassName="max-w-sm mx-8 !z-[9999] pointer-events-auto"
+                contentContainerClassName="relative pointer-events-auto"
+                classOverlay="!bg-black/40 !z-[9998]"
+                ctas={[
+                    {
+                        text: `Yes, cancel ${pendingCancel?.noun ?? 'deposit'}`,
+                        shadowSize: '4',
+                        className: 'md:py-2',
+                        onClick: confirmThenRun,
+                    },
+                ]}
+            />
+        </div>
+    )
 
     // 1. Bridge onramp pending — generic bank deposit cancel. Excludes REQUEST
     // rows (those take the dedicated request-cancel branch below).
@@ -66,11 +135,11 @@ export function CancelDepositActions({
         !!transaction.extraDataForDrawer?.depositInstructions
 
     if (showBridgeOnrampCancel) {
-        return (
+        return withError(
             <CancelButton
                 disabled={!!isLoading}
                 onClick={() =>
-                    wrapAction(async () => {
+                    armCancel('deposit', async () => {
                         const result = await cancelOnramp(transaction.id)
                         if (result.error) throw new Error(result.error)
                     })
@@ -83,11 +152,11 @@ export function CancelDepositActions({
     const showMantecaCancel = isMantecaOnrampEntry(transaction) && transaction.status === 'pending'
 
     if (showMantecaCancel) {
-        return (
+        return withError(
             <CancelButton
                 disabled={!!isLoading}
                 onClick={() =>
-                    wrapAction(async () => {
+                    armCancel('deposit', async () => {
                         const result = await mantecaApi.cancelDeposit(transaction.id)
                         if (result.error) throw new Error(result.error)
                     })
@@ -103,13 +172,13 @@ export function CancelDepositActions({
         isPendingBankRequest && transaction.extraDataForDrawer?.originalUserRole === EHistoryUserRole.SENDER
 
     if (showPendingBankRequestCancel) {
-        return (
+        return withError(
             <div className="pr-1">
                 <CancelButton
                     label="Cancel Request"
                     disabled={!!isLoading}
                     onClick={() =>
-                        wrapAction(async () => {
+                        armCancel('request', async () => {
                             const bridgeTransferId = transaction.extraDataForDrawer?.bridgeTransferId
                             if (!bridgeTransferId) {
                                 throw new Error('Cannot cancel REQUEST: missing bridgeTransferId on transaction')

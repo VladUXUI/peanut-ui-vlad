@@ -17,6 +17,9 @@ import type {
     TRequestResponse,
 } from '@/services/services.types'
 import { NATIVE_TOKEN_ADDRESS } from '@/utils/token.utils'
+import { isWithdrawFeeDisproportionate } from '@/utils/cross-chain-fee.utils'
+import { isAmountWithinBalance } from '@/utils/balance.utils'
+import { isBelowRhinoMinDeposit } from '@/utils/withdraw.utils'
 import * as peanutInterfaces from '@/interfaces/peanut-sdk-types'
 import { useRouter } from 'next/navigation'
 import { useCallback, useContext, useEffect, useMemo, useState } from 'react'
@@ -32,6 +35,7 @@ import { ROUTE_NOT_FOUND_ERROR } from '@/constants/general.consts'
 import { useCrossChainTransfer } from '@/features/payments/shared/hooks/useCrossChainTransfer'
 import { usePaymentRecorder } from '@/features/payments/shared/hooks/usePaymentRecorder'
 import { isTxReverted } from '@/utils/general.utils'
+import { appBaseUrl } from '@/utils/url.utils'
 import { ErrorHandler } from '@/utils/friendly-error.utils'
 import posthog from 'posthog-js'
 import { ANALYTICS_EVENTS } from '@/constants/analytics.consts'
@@ -39,7 +43,7 @@ import { ANALYTICS_EVENTS } from '@/constants/analytics.consts'
 export default function WithdrawCryptoPage() {
     const router = useRouter()
     const onBack = useSafeBack('/withdraw')
-    const { isConnected: isPeanutWallet, address, sendTransactions, sendMoney } = useWallet()
+    const { isConnected: isPeanutWallet, address, sendTransactions, sendMoney, spendableBalance } = useWallet()
     const { resetTokenContextProvider } = useContext(tokenSelectorContext)
     const {
         amountToWithdraw,
@@ -70,6 +74,7 @@ export default function WithdrawCryptoPage() {
         receiveAmount,
         payAmount,
         feeUsd,
+        minDepositLimitUsd,
         isCalculating,
         isXChain,
         isDiffToken,
@@ -205,7 +210,7 @@ export default function WithdrawCryptoPage() {
                 const chargePayload: CreateChargeRequest = {
                     pricing_type: 'fixed_price',
                     local_price: { amount: usdValue.toString(), currency: 'USD' },
-                    baseUrl: window.location.origin,
+                    baseUrl: appBaseUrl(),
                     requestId: newRequest.uuid,
                     requestProps: {
                         chainId: completeWithdrawData.chain.chainId.toString(),
@@ -421,14 +426,18 @@ export default function WithdrawCryptoPage() {
         setChargeDetails(null)
     }, [setCurrentView, clearErrors, setChargeDetails])
 
-    // reset withdraw flow when this component unmounts
+    // reset withdraw flow when this component unmounts. Resetting on unmount (rather
+    // than in the success view's onComplete) avoids a race: a synchronous reset clears
+    // amountToWithdraw and flips currentView off STATUS, which re-triggers the guard
+    // below and pushes '/withdraw' over the '/home' navigation from "Back to home".
     useEffect(() => {
         return () => {
             resetRouteCalculation()
             resetPaymentRecorder()
             resetTokenContextProvider() // reset token selector context to make sure previously selected token is not cached
+            resetWithdrawFlow()
         }
-    }, [resetRouteCalculation, resetPaymentRecorder, resetTokenContextProvider])
+    }, [resetRouteCalculation, resetPaymentRecorder, resetTokenContextProvider, resetWithdrawFlow])
 
     // Display payment errors first (user actions), then route errors (system limitations)
     const displayError = paymentError
@@ -436,6 +445,43 @@ export default function WithdrawCryptoPage() {
     // Get network fee from Rhino preview. Under SDA the fee is a transparent
     // bridge-fee in USD — no slippage distinction.
     const networkFee = useMemo<number>(() => feeUsd ?? 0, [feeUsd])
+
+    // Non-blocking heads-up when the bridge fee is a large share of the amount
+    // (flat mainnet gas dominating a small withdraw). The user can still proceed
+    // — the fee is shown honestly; we just flag it so a tiny mainnet withdrawal
+    // isn't a silent footgun. See cross-chain-fee.utils.ts.
+    const showHighFeeWarning = useMemo<boolean>(
+        () => isCrossChainWithdrawal && isWithdrawFeeDisproportionate(networkFee, parseFloat(usdAmount)),
+        [isCrossChainWithdrawal, networkFee, usdAmount]
+    )
+
+    // Pre-sign affordability gate for cross-chain. The input-time gate only
+    // checked the principal, but the kernel must spend principal + bridge fee
+    // (`payAmount`), so a withdraw that fit the balance at input can fall short
+    // here once the fee is known — and the send would surface the misleading
+    // "balance isn't fully available yet" (settling) error instead of an honest
+    // "not enough balance". Block it here with the right message. Only once the
+    // quote has resolved `payAmount` (skipped while calculating; CTA is disabled
+    // by isCalculating anyway).
+    const insufficientForFee = useMemo<boolean>(
+        () =>
+            isCrossChainWithdrawal &&
+            payAmount != null &&
+            spendableBalance !== undefined &&
+            !isAmountWithinBalance(payAmount, spendableBalance),
+        [isCrossChainWithdrawal, payAmount, spendableBalance]
+    )
+
+    // Rhino accepts SDA deposits below the route minimum on-chain but never
+    // bridges them — funds strand at the SDA, uncredited. Block the CTA before
+    // the user signs. Same-chain USDC transfers have no minimum.
+    const belowMinimumMessage = useMemo<string | null>(
+        () =>
+            isCrossChainWithdrawal && isBelowRhinoMinDeposit(payAmount, minDepositLimitUsd)
+                ? `The minimum withdrawal to this network is $${minDepositLimitUsd}. Enter a larger amount.`
+                : null,
+        [isCrossChainWithdrawal, payAmount, minDepositLimitUsd]
+    )
 
     if (!amountToWithdraw && currentView !== 'STATUS') {
         // Redirect to main withdraw page for amount input
@@ -470,6 +516,10 @@ export default function WithdrawCryptoPage() {
                     isCrossChain={isCrossChainWithdrawal}
                     isCalculating={isCalculating}
                     receiveAmount={receiveAmount}
+                    payAmount={payAmount}
+                    showHighFeeWarning={showHighFeeWarning}
+                    insufficientBalance={insufficientForFee}
+                    belowMinimumMessage={belowMinimumMessage}
                 />
             )}
 
@@ -491,9 +541,6 @@ export default function WithdrawCryptoPage() {
                                 address={withdrawData.address}
                             />
                         }
-                        onComplete={() => {
-                            resetWithdrawFlow()
-                        }}
                     />
                 </>
             )}

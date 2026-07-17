@@ -8,14 +8,14 @@
  * - logged in: "send with peanut" + executes payment
  */
 
-import { PEANUT_LOGO_BLACK, PEANUTMAN_LOGO } from '@/assets'
+import { PEANUT_LOGO_BLACK, PEANUTMAN } from '@/assets'
 import { Button, type ButtonProps } from '@/components/0_Bruddle/Button'
 import type { IconName } from '@/components/Global/Icons/Icon'
 import { useAuth } from '@/context/authContext'
 import { useAppDispatch } from '@/redux/hooks'
 import { setupActions } from '@/redux/slices/setup-slice'
 import { EInviteType } from '@/services/services.types'
-import { saveRedirectUrl, saveToLocalStorage } from '@/utils/general.utils'
+import { saveRedirectUrl, saveToLocalStorage, toInviteCode } from '@/utils/general.utils'
 import Image from 'next/image'
 import { useRouter } from 'next/navigation'
 import { useMemo } from 'react'
@@ -64,7 +64,7 @@ export default function SendWithPeanutCta({
                 window.location.pathname + window.location.search + window.location.hash
             )
             if (inviterUsername) {
-                const inviteCode = `${inviterUsername.toUpperCase()}INVITESYOU`
+                const inviteCode = toInviteCode(inviterUsername)
                 dispatch(setupActions.setInviteCode(inviteCode))
                 dispatch(setupActions.setInviteType(EInviteType.PAYMENT_LINK))
                 router.push(`/invite?code=${inviteCode}&redirect_uri=${redirectUri}`)
@@ -100,7 +100,7 @@ export default function SendWithPeanutCta({
     const peanutLogo = useMemo((): React.ReactNode => {
         return (
             <div className="flex items-center gap-1">
-                <Image src={PEANUTMAN_LOGO} alt="Peanut Logo" className="size-5" />
+                <Image src={PEANUTMAN} alt="Peanut Logo" className="size-5" />
                 <Image src={PEANUT_LOGO_BLACK} alt="Peanut Logo" />
             </div>
         )

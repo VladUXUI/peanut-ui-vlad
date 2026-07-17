@@ -9,7 +9,7 @@ import { PEANUT_WALLET_TOKEN_DECIMALS } from '@/constants/zerodev.consts'
 import { useWithdrawFlow } from '@/context/WithdrawFlowContext'
 import { useWallet } from '@/hooks/wallet/useWallet'
 import { tokenSelectorContext } from '@/context/tokenSelector.context'
-import { formatAmount } from '@/utils/general.utils'
+import { INSUFFICIENT_BALANCE_MESSAGE } from '@/utils/balance.utils'
 import { getCountryFromAccount, getCountryFromPath, getMinimumAmount } from '@/utils/bridge.utils'
 import useGetExchangeRate from '@/hooks/useGetExchangeRate'
 import { AccountType } from '@/interfaces'
@@ -81,15 +81,20 @@ export default function WithdrawPage() {
     // raw amount currently typed in the input
     const [rawTokenAmount, setRawTokenAmount] = useState<string>(amountFromContext || '')
 
-    const { spendableBalance: balance } = useWallet()
+    const { spendableBalance: balance, formattedSpendableBalance } = useWallet()
 
+    // Spend ceiling = the displayed total spendable. We gate on display (not an
+    // available-now subset) so we never block funds the live withdraw could route;
+    // an in-transit shortfall fails late with a settling message. See useWallet.
     const maxDecimalAmount = useMemo(() => {
         return balance !== undefined ? Number(formatUnits(balance, PEANUT_WALLET_TOKEN_DECIMALS)) : 0
     }, [balance])
 
+    // Displayed total spendable (smart + collateral), single-sourced + formatted
+    // by the hook. Empty while loading so we don't flash "$0.00".
     const peanutWalletBalance = useMemo(() => {
-        return balance !== undefined ? formatAmount(formatUnits(balance, PEANUT_WALLET_TOKEN_DECIMALS)) : ''
-    }, [balance])
+        return balance === undefined ? '' : formattedSpendableBalance
+    }, [balance, formattedSpendableBalance])
 
     // derive country and account type for minimum amount validation
     const { countryIso2, rateAccountType } = useMemo(() => {
@@ -109,14 +114,22 @@ export default function WithdrawPage() {
         return { countryIso2: '', rateAccountType: AccountType.US }
     }, [selectedBankAccount, selectedMethod])
 
+    // crypto withdrawals are plain on-chain transfers — fiat-rail minimums don't
+    // apply. selectedMethod is the routing source of truth (a stale bank method
+    // from an abandoned withdraw still routes to the bank flow, so it must keep
+    // its minimum); the URL param only covers the first render before the mount
+    // effect commits the crypto method.
+    const isCryptoWithdraw = selectedMethod ? selectedMethod.type === 'crypto' : isCryptoFromSend
+
     // fetch exchange rate for non-USD countries to convert local minimum to USD
     const { exchangeRate } = useGetExchangeRate({
         accountType: rateAccountType,
-        enabled: rateAccountType !== AccountType.US && countryIso2 !== '',
+        enabled: !isCryptoWithdraw && rateAccountType !== AccountType.US && countryIso2 !== '',
     })
 
     // compute minimum withdrawal in USD using the exchange rate
     const minUsdAmount = useMemo(() => {
+        if (isCryptoWithdraw) return 0 // any amount > 0 is valid, same as send-via-link
         const localMin = getMinimumAmount(countryIso2)
         // for US or unknown, minimum is already in USD
         if (!countryIso2 || countryIso2 === 'US') return localMin
@@ -126,7 +139,7 @@ export default function WithdrawPage() {
         const rate = parseFloat(exchangeRate || '0')
         if (rate <= 0) return 1 // fallback while rate is loading
         return Math.ceil(localMin / rate)
-    }, [countryIso2, exchangeRate])
+    }, [isCryptoWithdraw, countryIso2, exchangeRate])
 
     // validate against user's limits for bank withdrawals
     // note: crypto withdrawals don't have fiat limits
@@ -186,7 +199,11 @@ export default function WithdrawPage() {
             const price = selectedTokenData?.price ?? 0 // 0 for safety; will fail below
             const usdEquivalent = price ? amount * price : amount // if no price assume token pegged 1 USD
 
-            if (usdEquivalent >= minUsdAmount && amount <= maxDecimalAmount) {
+            // While the balance is still loading, maxDecimalAmount is 0 — skip the
+            // balance check so a pre-filled amount isn't false-blocked; the effect
+            // re-validates once it lands (validateAmount is in its deps).
+            const balanceLoaded = balance !== undefined
+            if (usdEquivalent >= minUsdAmount && (!balanceLoaded || amount <= maxDecimalAmount)) {
                 setError({ showError: false, errorMessage: '' })
                 return true
             }
@@ -198,15 +215,15 @@ export default function WithdrawPage() {
                 message = isFromSendFlow
                     ? `Minimum send amount is ${minDisplay}.`
                     : `Minimum withdrawal is ${minDisplay}.`
-            } else if (amount > maxDecimalAmount) {
-                message = 'Amount exceeds your wallet balance.'
+            } else if (balanceLoaded && amount > maxDecimalAmount) {
+                message = INSUFFICIENT_BALANCE_MESSAGE
             } else {
                 message = 'Please enter a valid amount.'
             }
             setError({ showError: true, errorMessage: message })
             return false
         },
-        [maxDecimalAmount, setError, selectedTokenData?.price, isFromSendFlow, minUsdAmount]
+        [balance, maxDecimalAmount, setError, selectedTokenData?.price, isFromSendFlow, minUsdAmount]
     )
 
     const handleTokenAmountChange = useCallback(
@@ -273,21 +290,37 @@ export default function WithdrawPage() {
             if (selectedMethod.type === 'crypto') {
                 const queryParams = isFromSendFlow ? `?${methodQueryParam}` : ''
                 router.push(`/withdraw/crypto${queryParams}`)
+            } else if (selectedMethod.type === 'manteca') {
+                // Manteca (AR/BR) accounts route to the Manteca flow. Checked BEFORE
+                // the generic saved-bank-account branch below — that branch targets
+                // the Bridge bank page via getCountryFromAccount and would both
+                // mis-route a Manteca account and throw when its country can't be
+                // resolved. Route directly with method + country params instead.
+                const mantecaMethodParam = selectedMethod.title?.toLowerCase().replace(/\s+/g, '-') || 'bank-transfer'
+                const additionalParams = isFromSendFlow ? `&${methodQueryParam}` : ''
+                router.push(
+                    `/withdraw/manteca?method=${mantecaMethodParam}&country=${selectedMethod.countryPath}${additionalParams}`
+                )
             } else if (selectedBankAccount) {
                 const country = getCountryFromAccount(selectedBankAccount)
                 if (country) {
                     const queryParams = isFromSendFlow ? `?${methodQueryParam}` : ''
                     router.push(withdrawBankUrl(country.path, queryParams))
                 } else {
-                    throw new Error('Failed to get country from bank account')
+                    // Never throw inside the click handler: a synchronous throw aborts
+                    // the router transition with no UI feedback, so the button silently
+                    // dies ("press Continue, nothing happens"). Surface a recoverable
+                    // error and log for observability instead.
+                    console.error('[withdraw] could not resolve country from saved bank account', {
+                        type: selectedBankAccount.type,
+                        countryName: selectedBankAccount.details?.countryName,
+                        countryCode: selectedBankAccount.details?.countryCode,
+                    })
+                    setError({
+                        showError: true,
+                        errorMessage: "We couldn't determine this account's country. Please contact support.",
+                    })
                 }
-            } else if (selectedMethod.type === 'manteca') {
-                // Route directly to Manteca with method and country params
-                const mantecaMethodParam = selectedMethod.title?.toLowerCase().replace(/\s+/g, '-') || 'bank-transfer'
-                const additionalParams = isFromSendFlow ? `&${methodQueryParam}` : ''
-                router.push(
-                    `/withdraw/manteca?method=${mantecaMethodParam}&country=${selectedMethod.countryPath}${additionalParams}`
-                )
             } else if (selectedMethod.type === 'bridge' && selectedMethod.countryPath) {
                 // Bridge countries go to country page for bank account form
                 const queryParams = isFromSendFlow ? `?${methodQueryParam}` : ''
@@ -296,6 +329,18 @@ export default function WithdrawPage() {
                 // Other countries go to their country pages
                 const queryParams = isFromSendFlow ? `?${methodQueryParam}` : ''
                 router.push(withdrawCountryUrl(selectedMethod.countryPath, queryParams))
+            } else {
+                // No branch matched the selected method — surface an error rather
+                // than leaving the user with a silently-dead Continue button.
+                console.error('[withdraw] no route matched for selected method', {
+                    type: selectedMethod.type,
+                    countryPath: selectedMethod.countryPath,
+                    hasBankAccount: !!selectedBankAccount,
+                })
+                setError({
+                    showError: true,
+                    errorMessage: 'Something went wrong setting up your withdrawal. Please contact support.',
+                })
             }
         }
     }
@@ -310,8 +355,10 @@ export default function WithdrawPage() {
         const usdEq = (selectedTokenData?.price ?? 1) * numericAmount
         if (usdEq < minUsdAmount) return true // below country-specific minimum
 
-        return numericAmount > maxDecimalAmount || error.showError
-    }, [rawTokenAmount, maxDecimalAmount, error.showError, selectedTokenData?.price, minUsdAmount])
+        // only apply the balance ceiling once it has loaded (maxDecimalAmount is 0
+        // while spendableBalance is undefined) — else Continue is disabled during load
+        return (balance !== undefined && numericAmount > maxDecimalAmount) || error.showError
+    }, [rawTokenAmount, balance, maxDecimalAmount, error.showError, selectedTokenData?.price, minUsdAmount])
 
     // native app: render country-specific views when ?country= is present
     const viewFromQuery = searchParams.get('view')
@@ -336,8 +383,7 @@ export default function WithdrawPage() {
 
     if (step === 'inputAmount') {
         // only show limits card for bank/manteca withdrawals, not crypto
-        const showLimitsCard =
-            selectedMethod?.type !== 'crypto' && (limitsValidation.isBlocking || limitsValidation.isWarning)
+        const showLimitsCard = !isCryptoWithdraw && (limitsValidation.isBlocking || limitsValidation.isWarning)
 
         return (
             <div className="flex min-h-[inherit] flex-col justify-start space-y-8">
@@ -394,8 +440,7 @@ export default function WithdrawPage() {
                         onClick={handleAmountContinue}
                         disabled={
                             isContinueDisabled ||
-                            (selectedMethod?.type !== 'crypto' &&
-                                (limitsValidation.isLoading || limitsValidation.isBlocking))
+                            (!isCryptoWithdraw && (limitsValidation.isLoading || limitsValidation.isBlocking))
                         }
                         className="w-full"
                     >

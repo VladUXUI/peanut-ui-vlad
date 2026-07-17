@@ -8,6 +8,7 @@
  * transformer runs (e.g. `extraDataForDrawer.cardPayment`).
  */
 
+import { isCryptoAddress, isUuid } from '@/utils/general.utils'
 import { type TransactionDetails } from './transactionTransformer'
 import type { IntentKind } from './strategies/registry'
 
@@ -23,11 +24,39 @@ export function isQRPayment(transaction: TransactionDetails): boolean {
     return isKind(transaction, 'QR_PAY')
 }
 
+/** A Rain card *spend* (not a refund or reversal). Kind-based so refunds
+ *  (REFUND/OTHER) and auth reversals are excluded. Card-spend eligibility for
+ *  the "Split this bill" CTA layers a settled-status check on top — see
+ *  {@link isSplittable}. */
+export function isCardSpend(transaction: TransactionDetails): boolean {
+    return isKind(transaction, 'CARD_SPEND_AUTH') || isKind(transaction, 'CARD_SPEND_CLEAR')
+}
+
+/** Eligible for the "Split this bill" CTA: a QR payment, or a card spend that
+ *  actually went through. This is an in-the-moment action right after paying,
+ *  so a freshly-authorized card hold (`pending`) IS splittable — settlement can
+ *  take days and we don't make users wait. The only card spends excluded are the
+ *  ones that didn't stick: refunded, failed, and `cancelled` (the auth was
+ *  reversed or expired — "Hold released, funds back on your card"). QR pays keep
+ *  their prior behaviour (splittable unless refunded/failed). */
+export function isSplittable(transaction: TransactionDetails): boolean {
+    if (transaction.status === 'refunded' || transaction.status === 'failed') return false
+    if (isQRPayment(transaction)) return true
+    if (isCardSpend(transaction)) return transaction.status !== 'cancelled'
+    return false
+}
+
+/** Kinds that move money across a fiat rail: bank on/off-ramps + QR pays.
+ *  The single anchor for the receipt-page whitelist (`getReceiptUrl`), the
+ *  share gate (`hasShareableReceipt`), and the FX predicate
+ *  (`isFxBearingFlow`) — previously three hand-kept copies of this set. */
+export const FIAT_RAIL_KINDS: ReadonlySet<string> = new Set(['QR_PAY', 'ONRAMP', 'OFFRAMP'])
+
 // Shareable receipts: QR payments + bank on/off-ramps. Kept as its own
-// predicate so "shareable" can diverge from "QR" later without a sweep.
+// predicate so "shareable" can diverge from "fiat rail" later without a sweep.
 export function hasShareableReceipt(transaction: TransactionDetails): boolean {
     const k = kindOf(transaction)
-    return k === 'QR_PAY' || k === 'ONRAMP' || k === 'OFFRAMP'
+    return !!k && FIAT_RAIL_KINDS.has(k)
 }
 
 // Renders "Completed" label for the timestamp row instead of "Sent"/"Received".
@@ -41,6 +70,23 @@ export function usesCompletedTimestampLabel(transaction: TransactionDetails): bo
  *  `extraDataForDrawer.cardPayment` for both — that's the discriminator. */
 export function isCardPaymentEntry(transaction: TransactionDetails): boolean {
     return transaction.extraDataForDrawer?.cardPayment != null
+}
+
+/** Flows that cross fiat ↔ USD and therefore carry an FX rate worth showing:
+ *  bank on/off-ramps, QR pays, and Rain card spends + refunds. Gating the
+ *  exchange-rate row on this (rather than a hand-kept `direction` allow-list)
+ *  is what stops the "forgot to add the new direction" bug class — card
+ *  refunds arrive as `direction: 'receive'` and were silently missed before.
+ *  The currency-block / non-stablecoin / not-cancelled checks still apply on
+ *  top; this only answers "is this the kind of flow that has an FX rate".
+ *
+ *  The card arm MUST stay `isCardPaymentEntry` (block-based), not a kind
+ *  check: card refunds can arrive with kind `OTHER`/`REFUND` (legacy rows the
+ *  fallback routes to cardRefund via `parentRainTxId`), so a pure-kind
+ *  "simplification" would silently drop their FX rate again. */
+export function isFxBearingFlow(transaction: TransactionDetails): boolean {
+    const k = kindOf(transaction)
+    return (!!k && FIAT_RAIL_KINDS.has(k)) || isCardPaymentEntry(transaction)
 }
 
 export function isPerkReward(transaction: TransactionDetails): boolean {
@@ -75,4 +121,28 @@ export function isOnrampEntry(transaction: TransactionDetails): boolean {
 // positive-identity discriminator.
 export function isMantecaOnrampEntry(transaction: TransactionDetails): boolean {
     return isKind(transaction, 'ONRAMP') && transaction.extraDataForDrawer?.provider === 'MANTECA'
+}
+
+// The counterparty is a real Peanut user with a public profile: a non-link
+// send / request / receive whose peer is an actual user (isPeerActuallyUser)
+// identified by a real username — not a raw crypto address (EVM/Solana/Tron,
+// the same rule VerifiedUserLabel renders by) and not a userId fallback
+// (usernameless users surface their UUID in `userName`, which has no profile
+// page). System copy strings ('Request', 'Recipient', reaper-fail text) are
+// already excluded because the transformer sets isPeerActuallyUser=false for
+// them. What a consumer does with the fact (clickable name, avatar, send-again
+// button) is the call site's business. Shared by the history row
+// (TransactionCard) and the receipt header (TransactionDetailsHeaderCard) —
+// keep the rule here so the two surfaces can't drift.
+export function hasUserProfile(transaction: TransactionDetails): boolean {
+    const type = transaction.extraDataForDrawer?.transactionCardType
+    const userName = transaction.userName
+    return (
+        !!transaction.isPeerActuallyUser &&
+        !transaction.extraDataForDrawer?.isLinkTransaction &&
+        !!userName &&
+        !isCryptoAddress(userName) &&
+        !isUuid(userName) &&
+        (type === 'send' || type === 'request' || type === 'receive')
+    )
 }

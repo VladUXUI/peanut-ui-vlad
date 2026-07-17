@@ -21,6 +21,7 @@ export const DEDICATED_ROUTES = [
     'rewards',
     'claim',
     'pay',
+    'pay-request',
     'request',
     'invite',
     'support',
@@ -32,18 +33,29 @@ export const DEDICATED_ROUTES = [
     'quests',
     'receipt',
     'crisp-proxy',
+    'card',
     'card-payment',
     'add-money',
     'withdraw',
     'sdk',
     'qr-pay',
+    'badges',
+    'limits',
+    'notifications',
+    'recover-funds',
+    'card-recovery',
+    'recover-wallet',
+    'fix-card-signature',
 
     // Public pages (existing)
+    'm', // merchant landing pages (/m/[slug]) — added on main; register so the catch-all never treats it as a recipient
     'careers',
+    'jobs',
     'privacy',
     'terms',
     'lp',
     'exchange',
+    'shhhhh',
 
     // Future SEO routes (pre-register so catch-all doesn't intercept)
     'send-money-to',
@@ -97,10 +109,13 @@ export const RESERVED_ROUTES: readonly string[] = [...DEDICATED_ROUTES, ...STATI
 export const PUBLIC_ROUTES_REGEX = /^\/(request\/pay|claim|pay\/.+|support|invite|qr|dev\/payment-graph)/
 
 /**
- * Regex for dev-only public routes (dev index, gift-test, shake-test)
- * Only matched when IS_DEV is true
+ * Regex for dev-only public routes: ALL /dev pages (index + every tool/preview).
+ * Only matched when IS_DEV is true (build-time NODE_ENV==='development'), so this
+ * never applies on prod/preview builds. /dev is also independently notFound()'d on
+ * peanut.me by dev/layout.tsx (except full-graph/payment-graph), so dev tooling is
+ * doubly walled off from prod — this just removes the login-redirect friction locally.
  */
-export const DEV_ONLY_PUBLIC_ROUTES_REGEX = /^\/(dev$|dev\/gift-test|dev\/shake-test|dev\/ds|dev\/components)/
+export const DEV_ONLY_PUBLIC_ROUTES_REGEX = /^\/dev(\/|$)/
 
 /**
  * Matches locale tags with a required subtag to avoid false-positives on short
@@ -126,6 +141,37 @@ export function isReservedRoute(path: string): boolean {
     const firstSegment = path.split('/')[1]?.toLowerCase()
     if (!firstSegment) return false
     return RESERVED_ROUTES.includes(firstSegment as any) || isLocaleSegment(firstSegment)
+}
+
+/**
+ * Username validation — mirror of the rule in src/components/Setup/Views/Signup.tsx
+ * (4-12 chars, lowercase letters + digits, must start with a letter). If we widen
+ * this server-side, update both call sites.
+ */
+const USERNAME_PATTERN = /^[a-z][a-z0-9]{3,11}$/
+
+/**
+ * Helper to check if a first segment could plausibly identify a payment recipient:
+ * a Peanut username, an EVM address, an ENS name, or a `username@chain` handle.
+ * Anything else (bare locale codes, random strings, things with dashes/dots) should
+ * 404 instead of falling through to the recipient catch-all and rendering a profile.
+ */
+export function couldBeRecipient(segment: string): boolean {
+    if (!segment) return false
+    let decoded: string
+    try {
+        decoded = decodeURIComponent(segment).toLowerCase()
+    } catch {
+        // malformed percent-encoding (e.g. lone '%') → not a recipient
+        return false
+    }
+    // EVM address
+    if (/^0x[0-9a-f]{40}$/.test(decoded)) return true
+    // ENS name
+    if (decoded.endsWith('.eth') && decoded.length > 4) return true
+    // username@chain handle (chain validation happens downstream)
+    const base = decoded.includes('@') ? decoded.split('@')[0] : decoded
+    return USERNAME_PATTERN.test(base)
 }
 
 /**

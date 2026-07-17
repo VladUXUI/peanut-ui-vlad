@@ -3,7 +3,6 @@ import Modal from '../Modal'
 import { Icon, type IconName } from '../Icons/Icon'
 import ActionModal from '../ActionModal'
 import { useRouter } from 'next/navigation'
-import StartVerificationView from './StartVerificationView'
 import { useModalsContext } from '@/context/ModalsContext'
 import { Button, type ButtonVariant } from '@/components/0_Bruddle/Button'
 
@@ -12,15 +11,13 @@ export type IFrameWrapperProps = {
     visible: boolean
     onClose: (source?: 'manual' | 'completed' | 'tos_accepted') => void
     closeConfirmMessage?: string
-    skipStartView?: boolean
 }
 
-const IframeWrapper = ({ src, visible, onClose, closeConfirmMessage, skipStartView }: IFrameWrapperProps) => {
+const IframeWrapper = ({ src, visible, onClose, closeConfirmMessage }: IFrameWrapperProps) => {
     const enableConfirmationPrompt = closeConfirmMessage !== undefined
     const [isHelpModalOpen, setIsHelpModalOpen] = useState(false)
     const [modalVariant, setModalVariant] = useState<'stop-verification' | 'trouble'>('trouble')
     const [copied, setCopied] = useState(false)
-    const [isVerificationStarted, setIsVerificationStarted] = useState(skipStartView ?? false)
     const router = useRouter()
     const { setIsSupportModalOpen } = useModalsContext()
 
@@ -34,10 +31,10 @@ const IframeWrapper = ({ src, visible, onClose, closeConfirmMessage, skipStartVi
     const modalDetails = useMemo(() => {
         if (modalVariant === 'trouble') {
             return {
-                title: 'Having trouble verifying?',
+                title: 'Need a hand?',
                 description: (
                     <p>
-                        If the verification isn&apos;t loading here, you can finish it in your browser.
+                        If the ID check isn&apos;t loading here, finish it in your browser.
                         <br />
                         Just copy this link and open it there.
                     </p>
@@ -72,13 +69,13 @@ const IframeWrapper = ({ src, visible, onClose, closeConfirmMessage, skipStartVi
         }
 
         return {
-            title: 'Stop verification?',
-            description: 'If you exit now, your verification won’t be completed and you’ll need to start again later.',
+            title: 'Exit for now?',
+            description: 'You can come back and finish this anytime.',
             icon: 'alert' as IconName,
             iconContainerClassName: 'bg-secondary-1',
             ctas: [
                 {
-                    text: 'Stop verification',
+                    text: 'Exit',
                     onClick: () => {
                         setIsHelpModalOpen(false)
                         onClose('manual')
@@ -135,49 +132,42 @@ const IframeWrapper = ({ src, visible, onClose, closeConfirmMessage, skipStartVi
             preventClose={true}
             hideOverlay={false}
         >
-            {!isVerificationStarted ? (
-                <StartVerificationView
-                    onClose={() => onClose('manual')}
-                    onStartVerification={() => setIsVerificationStarted(true)}
-                />
-            ) : (
-                <div className="flex h-full flex-col gap-2 p-0">
-                    <div className="h-full w-full flex-grow overflow-scroll">
-                        <iframe
-                            key={src}
-                            src={src}
-                            allow="camera *; microphone *; fullscreen *"
-                            style={{ width: '100%', height: '85%', border: 'none' }}
-                            className="rounded-md"
-                            sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-modals allow-top-navigation-by-user-activation allow-media-devices"
-                        />
-                        <div className="flex h-[15%] w-full flex-col items-center justify-center gap-2 px-5">
-                            <Button
-                                variant={'transparent'}
-                                className={`h-8 max-w-md font-normal underline`}
-                                onClick={() => {
-                                    setModalVariant('stop-verification')
-                                    setIsHelpModalOpen(true)
-                                }}
-                                shadowType="primary"
-                            >
-                                Stop verification process
-                            </Button>
+            <div className="flex h-full flex-col gap-2 p-0" style={{ paddingTop: 'env(safe-area-inset-top)' }}>
+                <div className="h-full w-full flex-grow overflow-scroll">
+                    <iframe
+                        key={src}
+                        src={src}
+                        allow="camera *; microphone *; fullscreen *"
+                        style={{ width: '100%', height: '85%', border: 'none' }}
+                        className="rounded-md"
+                        sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-modals allow-top-navigation-by-user-activation allow-media-devices"
+                    />
+                    <div className="flex h-[15%] w-full flex-col items-center justify-center gap-2 px-5">
+                        <Button
+                            variant={'transparent'}
+                            className={`h-8 max-w-md font-normal underline`}
+                            onClick={() => {
+                                setModalVariant('stop-verification')
+                                setIsHelpModalOpen(true)
+                            }}
+                            shadowType="primary"
+                        >
+                            Stop verification process
+                        </Button>
 
-                            <button
-                                onClick={() => {
-                                    setModalVariant('trouble')
-                                    setIsHelpModalOpen(true)
-                                }}
-                                className="flex items-center gap-1"
-                            >
-                                <Icon name="peanut-support" size={16} className="text-grey-1" />
-                                <p className="text-xs font-medium text-grey-1 underline">Having trouble?</p>
-                            </button>
-                        </div>
+                        <button
+                            onClick={() => {
+                                setModalVariant('trouble')
+                                setIsHelpModalOpen(true)
+                            }}
+                            className="flex items-center gap-1"
+                        >
+                            <Icon name="peanut-support" size={16} className="text-grey-1" />
+                            <p className="text-xs font-medium text-grey-1 underline">Having trouble?</p>
+                        </button>
                     </div>
                 </div>
-            )}
+            </div>
             <ActionModal
                 visible={isHelpModalOpen}
                 onClose={() => setIsHelpModalOpen(false)}

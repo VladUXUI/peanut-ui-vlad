@@ -1,6 +1,7 @@
 'use client'
 import { useToast } from '@/components/0_Bruddle/Toast'
 import { useUserQuery } from '@/hooks/query/user'
+import { useUserAutoRefresh } from '@/hooks/useUserAutoRefresh'
 import type { IUserProfile } from '@/interfaces/interfaces'
 import { useAppDispatch } from '@/redux/hooks'
 import { setupActions } from '@/redux/slices/setup-slice'
@@ -16,11 +17,12 @@ import { apiFetch } from '@/utils/api-fetch'
 import { isCapacitor } from '@/utils/capacitor'
 import { clearAuthToken } from '@/utils/auth-token'
 import { resetCrispProxySessions } from '@/utils/crisp'
+import { disableDemoMode } from '@/utils/demo'
 import posthog from 'posthog-js'
 import { useQueryClient } from '@tanstack/react-query'
 import { useRouter } from 'next/navigation'
 import { createContext, type ReactNode, useContext, useState, useEffect, useMemo, useCallback } from 'react'
-import { captureException } from '@sentry/nextjs'
+import { captureException, setUser as setSentryUser } from '@sentry/nextjs'
 // import { PUBLIC_ROUTES_REGEX } from '@/constants/routes'
 import { USER_DATA_CACHE_PATTERNS } from '@/constants/cache.consts'
 
@@ -67,6 +69,12 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
     const { data: user, isLoading: isFetchingUser, refetch: fetchUser, error: userFetchError } = useUserQuery()
 
+    // Singleton auto-refresh poller — keeps the user query fresh while any
+    // rail is provisioning OR a recent submission window is open. Mounted
+    // here (rather than in useCapabilities) so N consumers share ONE interval
+    // + one in-flight guard. See useUserAutoRefresh for the predicate.
+    useUserAutoRefresh({ user, fetchUser })
+
     // Pre-compute a Set of invited usernames for O(1) lookups
     const invitedUsernamesSet = useMemo(() => {
         if (!user?.invitesSent) return new Set<string>()
@@ -80,9 +88,32 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
                 window.gtag('set', { user_id: user.user.userId })
             }
             // PostHog: identify user (stitches anonymous pre-login events to this user)
+            // and enrich the person profile for segmentation. Property names mirror the
+            // server-side identify in peanut-api-ts src/log/identifyUser.ts — keep in sync.
+            // `name` duplicates username because PostHog's Persons-page search is
+            // hardcoded to email/name/distinct_id — username alone is not searchable.
             posthog.identify(user.user.userId, {
                 username: user.user.username,
+                name: user.user.username,
+                userId: user.user.userId,
+                totalPoints: user.totalPoints,
+                // Badge codes (human-readable identifier), never the uuid.
+                badges: user.user.badges?.map((badge) => badge.code) ?? [],
+                kycStatus: user.identityVerification?.status ?? 'not_started',
             })
+            // Sentry: every error captured from here on inherits user context
+            // as searchable Sentry tags. Closes the historical gap where FE
+            // errors were anonymous and had to be cross-referenced via the
+            // posthog $sentry_url field to figure out which user hit them.
+            setSentryUser({
+                id: user.user.userId,
+                username: user.user.username ?? undefined,
+                email: user.user.email ?? undefined,
+            })
+        } else {
+            // Logout / unauthenticated: clear Sentry user so subsequent
+            // anonymous-session errors don't get misattributed.
+            setSentryUser(null)
         }
     }, [user])
 
@@ -165,7 +196,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
         // clear auth tokens (localStorage in capacitor, cookie on web)
         removeFromCookie(WEB_AUTHN_COOKIE_KEY)
-        clearAuthToken()
+        await clearAuthToken()
 
         // clear redirect url
         clearRedirectUrl()
@@ -201,6 +232,9 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         try {
             sessionStorage.removeItem('hasSeenIOSPWAPromptThisSession')
         } catch {}
+
+        // clear demo mode flag
+        disableDemoMode()
 
         // reset third-party sessions (non-fatal)
         try {

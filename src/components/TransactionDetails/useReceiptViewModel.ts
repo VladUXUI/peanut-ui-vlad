@@ -10,6 +10,8 @@ import {
 import {
     hasShareableReceipt,
     isCardPaymentEntry,
+    isCardSpend as isCardSpendTransaction,
+    isFxBearingFlow,
     isDirectSendEntry,
     isMantecaOnrampEntry,
     isOnrampEntry,
@@ -45,6 +47,7 @@ export interface ReceiptViewModel {
     isPendingRequester: boolean
     isPendingSentLink: boolean
     isQRPayment: boolean
+    isCardSpend: boolean
 
     /** Country resolved from the transaction's currency code (used by the
      *  Manteca deposit-info row for the country-specific address label). */
@@ -196,9 +199,7 @@ export function useReceiptViewModel(
             refunded: transaction.status === 'refunded',
             fee: transaction.fee !== undefined && transaction.status !== 'cancelled',
             exchangeRate: !!(
-                (transaction.direction === 'bank_deposit' ||
-                    transaction.direction === 'qr_payment' ||
-                    transaction.direction === 'bank_withdraw') &&
+                isFxBearingFlow(transaction) &&
                 transaction.currency?.code &&
                 transaction.currency.code.toUpperCase() !== 'USD' &&
                 // No FX between USD and USDC/USDT — suppress the rate row.
@@ -296,6 +297,7 @@ export function useReceiptViewModel(
     }, [transaction])
 
     const isQRPayment = transaction ? isQRPaymentTransaction(transaction) : false
+    const isCardSpend = transaction ? isCardSpendTransaction(transaction) : false
     const formattedTotalAmountCollected = formatCurrency(transaction?.totalAmountCollected?.toString() ?? '0', 2, 0)
 
     return {
@@ -306,6 +308,7 @@ export function useReceiptViewModel(
         isPendingRequester,
         isPendingSentLink,
         isQRPayment,
+        isCardSpend,
         country,
         rowVisibilityConfig,
         shouldHideBorder,

@@ -7,10 +7,13 @@
  * the root layout (server component) renders this single client boundary.
  */
 import { ConsoleGreeting } from '@/components/Global/ConsoleGreeting'
+import RainCooldownIntroModal from '@/components/Global/RainCooldown/IntroModal'
+import StaleCardApprovalReEnableModal from '@/components/Global/StaleCardApproval/ReEnableModal'
+import BadgeEarnToast from '@/components/Badges/BadgeEarnToast'
 import { ScreenOrientationLocker } from '@/components/Global/ScreenOrientationLocker'
 import { TranslationSafeWrapper } from '@/components/Global/TranslationSafeWrapper'
-import { PeanutProvider } from '@/config'
-import { ContextProvider } from '@/context'
+import { PeanutProvider } from '@/config/peanut.config'
+import { ContextProvider } from '@/context/contextProvider'
 import { FooterVisibilityProvider } from '@/context/footerVisibility'
 import { HARNESS_ENABLED } from '@/constants/harness.consts'
 import { useOtaUpdates } from '@/hooks/useOtaUpdates'
@@ -40,6 +43,18 @@ export function ClientProviders({ children }: { children: React.ReactNode }) {
                             <ConsoleGreeting />
                             <ScreenOrientationLocker />
                             <PeanutDebug />
+                            {/* Mounted here (not in a route-group layout) so the cooldown
+                                explainer also covers public pay/send/request pages —
+                                the rain:cooldown event fires on every spend path. */}
+                            <RainCooldownIntroModal />
+                            {/* Global recovery prompt: a withdraw refused with 409
+                                STALE_CARD_APPROVAL (stale session-key approval) fires
+                                RAIN_STALE_APPROVAL_EVENT — mount here so the re-enable
+                                CTA covers every spend path, not just the card screen. */}
+                            <StaleCardApprovalReEnableModal />
+                            {/* Non-intrusive "badge unlocked" toast on /home (TASK-19791).
+                                Global so it surfaces wherever the user lands after earning. */}
+                            <BadgeEarnToast />
                             {HarnessBootstrap && (
                                 <Suspense fallback={null}>
                                     <HarnessBootstrap />

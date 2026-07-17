@@ -5,6 +5,26 @@
         "permanent": false
     },
     {
+        "source": "/es",
+        "destination": "/",
+        "permanent": true
+    },
+    {
+        "source": "/es/:path*",
+        "destination": "/es-419/:path*",
+        "permanent": true
+    },
+    {
+        "source": "/pt",
+        "destination": "/",
+        "permanent": true
+    },
+    {
+        "source": "/pt/:path*",
+        "destination": "/pt-br/:path*",
+        "permanent": true
+    },
+    {
         "source": "/es-419",
         "destination": "/",
         "permanent": false
@@ -91,6 +111,16 @@
         "permanent": true
     },
     {
+        "source": "/sh",
+        "destination": "/card",
+        "permanent": false
+    },
+    {
+        "source": "/sh/:path*",
+        "destination": "/card",
+        "permanent": false
+    },
+    {
         "source": "/pints",
         "destination": "https://luma.com/zwh7l3ro",
         "permanent": false
@@ -123,6 +153,26 @@
     {
         "source": "/press-kit",
         "destination": "https://peanutprotocol.notion.site/Press-Kit-12f83811757981fc9ca5de581b20f50d",
+        "permanent": true
+    },
+    {
+        "source": "/:locale/deposit/via-avalanche",
+        "destination": "/:locale/supported-networks",
+        "permanent": true
+    },
+    {
+        "source": "/:locale/withdraw/avalanche",
+        "destination": "/:locale/supported-networks",
+        "permanent": true
+    },
+    {
+        "source": "/:locale/deposit/from-faster-payments",
+        "destination": "/:locale/deposit/via-faster-payments",
+        "permanent": true
+    },
+    {
+        "source": "/:locale/deposit/from-spei",
+        "destination": "/:locale/deposit/via-spei",
         "permanent": true
     }
 ]

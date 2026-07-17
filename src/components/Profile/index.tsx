@@ -7,26 +7,28 @@ import NavHeader from '../Global/NavHeader'
 import ProfileHeader from './components/ProfileHeader'
 import ProfileMenuItem from './components/ProfileMenuItem'
 import { useRouter } from 'next/navigation'
-import { useState, useMemo } from 'react'
-import useKycStatus from '@/hooks/useKycStatus'
+import { useState } from 'react'
+import { useIdentityVerification } from '@/hooks/useIdentityVerification'
 import { useSafeBack } from '@/hooks/useSafeBack'
-import { useCardPioneerInfo } from '@/hooks/useCardPioneerInfo'
-import underMaintenanceConfig from '@/config/underMaintenance.config'
+import { useCardInfo } from '@/hooks/useCardInfo'
 import Card from '../Global/Card'
+import DeleteAccountButton from '@/components/Settings/DeleteAccountButton'
 import ShowNameToggle from './components/ShowNameToggle'
-import KycVerifiedOrReviewModal from '../Global/KycVerifiedOrReviewModal'
 import InviteFriendsModal from '../Global/InviteFriendsModal'
-import { STAR_STRAIGHT_ICON } from '@/assets'
+import STAR_STRAIGHT_ICON from '@/assets/icons/starStraight.svg'
 import Image from 'next/image'
 
 export const Profile = () => {
     const { logoutUser, isLoggingOut, user } = useAuth()
-    const [isKycApprovedModalOpen, setIsKycApprovedModalOpen] = useState(false)
     const [isInviteFriendsModalOpen, setIsInviteFriendsModalOpen] = useState(false)
     const router = useRouter()
     const onBack = useSafeBack('/home')
-    const { isUserKycApproved } = useKycStatus()
-    const { hasCardAccess } = useCardPioneerInfo()
+    // Profile "verified" reflects identity verification only (the human was ID-verified) — NOT
+    // rail approval. Switched from `useCapabilities().isKycApproved` (any enabled rail, including
+    // Rain) to the provider-blind identityVerification projection, which today mirrors Sumsub
+    // applicant state. Bridge/Manteca rail approval does NOT flip this badge.
+    const { isVerified: isUserSumsubKycApproved } = useIdentityVerification()
+    const { hasCardAccess } = useCardInfo()
 
     const logout = async () => {
         await logoutUser()
@@ -35,13 +37,12 @@ export const Profile = () => {
     const username = user?.user.username || 'anonymous'
     // respect user's showFullName preference: use fullName only if showFullName is true, otherwise use username
     const displayName = user?.user.showFullName && user?.user.fullName ? user.user.fullName : username
-    const showCard = useMemo(() => !underMaintenanceConfig.disableCardPioneers || hasCardAccess, [hasCardAccess])
 
     return (
         <div className="h-full w-full bg-background">
             <NavHeader hideLabel showLogoutBtn onPrev={onBack} />
             <div className="space-y-8">
-                <ProfileHeader name={displayName} username={username} isVerified={isUserKycApproved} />
+                <ProfileHeader name={displayName} username={username} isVerified={isUserSumsubKycApproved} />
                 <div className="space-y-4">
                     <ProfileMenuItem
                         icon="smile"
@@ -52,15 +53,21 @@ export const Profile = () => {
                     />
                     {/* Menu Items - First Group */}
                     <div>
-                        {showCard && (
-                            <ProfileMenuItem icon="credit-card" label="Your Card" href="/card" position="first" />
-                        )}
+                        {/* Card row shows for everyone. Holders go straight to /card;
+                            everyone else lands on /shhhhh — the waitlist/explainer door,
+                            the canonical card entry point — whose CTA forwards on to /card
+                            post-launch. We deliberately DON'T send non-holders to /card:
+                            it notFound()s users without card access. `hasCardAccess` is
+                            undefined while useCardInfo loads, falling to the /shhhhh path —
+                            the safe default (never 404s; the gated /card route would). */}
                         <ProfileMenuItem
-                            icon="achievements"
-                            label="Your Badges"
-                            href="/badges"
-                            position={showCard ? 'middle' : 'first'}
+                            icon="credit-card"
+                            label={hasCardAccess ? 'Your Card' : 'Peanut Card'}
+                            href={hasCardAccess ? '/card' : '/shhhhh'}
+                            badge={hasCardAccess ? undefined : 'New!'}
+                            position="first"
                         />
+                        <ProfileMenuItem icon="achievements" label="Your Badges" href="/badges" position="middle" />
                         <ProfileMenuItem
                             icon={<Image src={STAR_STRAIGHT_ICON} alt="star" width={20} height={20} />}
                             label="Points"
@@ -73,10 +80,10 @@ export const Profile = () => {
 
                         <ProfileMenuItem
                             icon="globe-lock"
-                            label="Regions & Verification"
+                            label="Unlocked regions"
                             href="/profile/identity-verification"
                             position="middle"
-                            highlight={!isUserKycApproved}
+                            highlight={!isUserSumsubKycApproved}
                         />
 
                         <ProfileMenuItem icon="meter" label="Payment limits" href="/limits" position="middle" />
@@ -115,9 +122,10 @@ export const Profile = () => {
                         label="Exchange rates and fees"
                         href="/profile/exchange-rate"
                         position="single"
+                        iconClassName="size-4"
                     />
-                    {/* Logout Button */}
-                    <div className="w-full pb-10">
+                    {/* Logout + Delete account */}
+                    <div className="w-full space-y-6 pb-10">
                         <Button
                             loading={isLoggingOut}
                             disabled={isLoggingOut}
@@ -129,14 +137,10 @@ export const Profile = () => {
                             <Icon name="logout" size={20} fill="black" />
                             <span className="font-bold">Log out</span>
                         </Button>
+                        <DeleteAccountButton />
                     </div>
                 </div>
             </div>
-
-            <KycVerifiedOrReviewModal
-                isKycApprovedModalOpen={isKycApprovedModalOpen}
-                onClose={() => setIsKycApprovedModalOpen(false)}
-            />
 
             <InviteFriendsModal
                 visible={isInviteFriendsModalOpen}

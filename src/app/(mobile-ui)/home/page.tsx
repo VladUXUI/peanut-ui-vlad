@@ -23,9 +23,10 @@ import { PostSignupActionManager } from '@/components/Global/PostSignupActionMan
 import { useWithdrawFlow } from '@/context/WithdrawFlowContext'
 import { useClaimBankFlow } from '@/context/ClaimBankFlowContext'
 import { useNotifications } from '@/hooks/useNotifications'
-import useKycStatus from '@/hooks/useKycStatus'
-import { useCardPioneerInfo } from '@/hooks/useCardPioneerInfo'
+import { useCapabilities } from '@/hooks/useCapabilities'
+import { useCardInfo } from '@/hooks/useCardInfo'
 import HomeCarouselCTA from '@/components/Home/HomeCarouselCTA'
+import CardLaunchCTA from '@/components/Home/CardLaunchCTA'
 import EnableAutoBalanceBanner from '@/components/Home/EnableAutoBalanceBanner'
 import InvitesIcon from '@/components/Home/InvitesIcon'
 import NavigationArrow from '@/components/Global/NavigationArrow'
@@ -45,9 +46,8 @@ const BalanceWarningModal = lazy(() => import('@/components/Global/BalanceWarnin
 const SetupNotificationsModal = lazy(() => import('@/components/Notifications/SetupNotificationsModal'))
 const NoMoreJailModal = lazy(() => import('@/components/Global/NoMoreJailModal'))
 const EarlyUserModal = lazy(() => import('@/components/Global/EarlyUserModal'))
-const KycCompletedModal = lazy(() => import('@/components/Home/KycCompletedModal'))
+const WelcomeUnlockModal = lazy(() => import('@/components/Home/WelcomeUnlockModal'))
 const IosPwaInstallModal = lazy(() => import('@/components/Global/IosPwaInstallModal'))
-const CardPioneerModal = lazy(() => import('@/components/Card/CardPioneerModal'))
 
 const BALANCE_WARNING_THRESHOLD = parseInt(process.env.NEXT_PUBLIC_BALANCE_WARNING_THRESHOLD ?? '500')
 const BALANCE_WARNING_EXPIRY = parseInt(process.env.NEXT_PUBLIC_BALANCE_WARNING_EXPIRY ?? '1814400') // 21 days in seconds
@@ -67,18 +67,16 @@ export default function Home() {
     const { triggerHaptic } = useHaptic()
 
     const { isFetchingUser, fetchUser } = useAuth()
-    const { isUserKycApproved } = useKycStatus()
+    const { isKycApproved } = useCapabilities()
     const { isActivated, activationStep, dismissCardStep } = useActivationStatus()
-    const {
-        hasPurchased: hasCardPioneerPurchased,
-        isLoading: isCardInfoLoading,
-        error: cardInfoError,
-    } = useCardPioneerInfo()
+    // Fire-and-forget: warms the card-info cache so /card mounts fast.
+    // Return values intentionally unused — only the fetch side effect matters.
+    useCardInfo()
     const username = user?.user.username
 
     const [showBalanceWarningModal, setShowBalanceWarningModal] = useState(false)
     const [isPostSignupActionModalVisible, setIsPostSignupActionModalVisible] = useState(false)
-    const [showKycModal, setShowKycModal] = useState(user?.user.showKycCompletedModal ?? false)
+    const [showKycModal, setShowKycModal] = useState(false)
 
     // Track if this is a fresh signup session - captured once on mount so it persists
     // even after NoMoreJailModal clears the sessionStorage key
@@ -92,12 +90,16 @@ export default function Home() {
         fetchUser()
     }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-    // sync modal state with user data when it changes
+    // Show the "You're unlocked" celebration exactly once: the user has a usable
+    // rail (isKycApproved) and has never dismissed it (activationCelebratedAt is
+    // null, stamped server-side on dismiss). A KYC re-approval can't resurface it
+    // — unlike the old showKycCompletedModal flag, which re-fired on every
+    // `→ approved` transition (e.g. the faster_payments endorsement backfill).
     useEffect(() => {
-        if (user?.user.showKycCompletedModal !== undefined) {
-            setShowKycModal(user.user.showKycCompletedModal)
+        if (isKycApproved && !user?.user.activationCelebratedAt) {
+            setShowKycModal(true)
         }
-    }, [user?.user.showKycCompletedModal])
+    }, [isKycApproved, user?.user.activationCelebratedAt])
 
     const userFullName = useMemo(() => {
         if (!user) return
@@ -170,7 +172,7 @@ export default function Home() {
         <PageContainer>
             <div className="h-full w-full space-y-6 p-5">
                 <div className="flex items-center justify-between gap-2">
-                    <UserHeader username={username!} fullName={userFullName} isVerified={isUserKycApproved} />
+                    <UserHeader username={username!} fullName={userFullName} isVerified={isKycApproved} />
                     {isActivated && (
                         <Link onClick={() => triggerHaptic()} href="/rewards" className="flex items-center gap-0">
                             <InvitesIcon />
@@ -207,6 +209,11 @@ export default function Home() {
 
                 <div className="space-y-2">
                     <EnableAutoBalanceBanner />
+                    {/* Public-launch splash. Self-gating (see CardLaunchCTA): shows post-
+                        launch to activated, geo-eligible, card-less, non-waitlisted users;
+                        dismiss/click hides it forever. Rendered above the carousel/activation
+                        CTAs so it leads the home stack on launch day. */}
+                    <CardLaunchCTA />
                     {isActivated ? (
                         <HomeCarouselCTA />
                     ) : (
@@ -250,7 +257,7 @@ export default function Home() {
 
             <LazyLoadErrorBoundary>
                 <Suspense fallback={null}>
-                    <KycCompletedModal
+                    <WelcomeUnlockModal
                         isOpen={showKycModal && !showBalanceWarningModal}
                         onClose={async () => {
                             // close the modal immediately for better ux
@@ -259,7 +266,7 @@ export default function Home() {
                             if (user?.user.userId) {
                                 await updateUserById({
                                     userId: user.user.userId,
-                                    showKycCompletedModal: false,
+                                    dismissActivationCelebration: true,
                                 })
                                 // refetch user to ensure the modal doesn't reappear
                                 await fetchUser()
@@ -295,23 +302,6 @@ export default function Home() {
 
             {/* Card Pioneer Modal - Show to all users who haven't purchased */}
             {/* Eligibility check happens during the flow (geo screen), not here */}
-            {/* Only shows if no higher-priority modals are active and card info loaded successfully */}
-            {!underMaintenanceConfig.disableCardPioneers &&
-                !isCardInfoLoading &&
-                !cardInfoError &&
-                !showBalanceWarningModal &&
-                !showPermissionModal &&
-                !showKycModal &&
-                !isPostSignupActionModalVisible &&
-                !user?.showEarlyUserModal &&
-                !isPostSignupSession && (
-                    <LazyLoadErrorBoundary>
-                        <Suspense fallback={null}>
-                            <CardPioneerModal hasPurchased={hasCardPioneerPurchased ?? false} />
-                        </Suspense>
-                    </LazyLoadErrorBoundary>
-                )}
-
             <PostSignupActionManager onActionModalVisibilityChange={setIsPostSignupActionModalVisible} />
         </PageContainer>
     )

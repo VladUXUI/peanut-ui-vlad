@@ -15,7 +15,13 @@ import { twMerge } from 'tailwind-merge'
 
 import { Button } from '@/components/0_Bruddle/Button'
 import Divider from '@/components/0_Bruddle/Divider'
-import { PEANUT_WALLET_CHAIN, PEANUT_WALLET_TOKEN } from '@/constants/zerodev.consts'
+import {
+    PEANUT_WALLET_CHAIN,
+    PEANUT_WALLET_TOKEN,
+    PEANUT_WALLET_TOKEN_SYMBOL,
+    PEANUT_WALLET_TOKEN_DECIMALS,
+    PEANUT_WALLET_TOKEN_NAME,
+} from '@/constants/zerodev.consts'
 import { tokenSelectorContext } from '@/context'
 import { type IToken, type IUserBalance } from '@/interfaces'
 import { areEvmAddressesEqual, isNativeCurrency, getChainName } from '@/utils/general.utils'
@@ -28,12 +34,18 @@ import ScrollableList from './Components/ScrollableList'
 import SearchInput from './Components/SearchInput'
 import TokenListItem from './Components/TokenListItem'
 import {
+    RHINO_WITHDRAW_SUPPORTED_TOKENS_BY_CHAIN,
     TOKEN_SELECTOR_COMING_SOON_NETWORKS,
     TOKEN_SELECTOR_POPULAR_NETWORK_IDS,
     TOKEN_SELECTOR_SUPPORTED_NETWORK_IDS,
 } from './TokenSelector.consts'
+import { useChainRollout } from '@/hooks/useChainRollout'
 import { Drawer, DrawerContent, DrawerTitle } from '../Drawer'
 import underMaintenanceConfig from '@/config/underMaintenance.config'
+
+// USDC logo for the hardcoded USDC-on-Arbitrum fallback (when the token list
+// hasn't loaded — e.g. demo mode — and cross-chain is disabled).
+const USDC_ARBITRUM_LOGO = 'https://assets.coingecko.com/coins/images/33000/thumb/usdc.png?1700119918'
 
 interface SectionProps {
     title: string
@@ -66,6 +78,17 @@ const TokenSelector: React.FC<NewTokenSelectorProps> = ({ classNameButton, viewT
         (viewType === 'claim' || viewType === 'req_pay') && underMaintenanceConfig.disableXchainSend
     // combined flag for any cross-chain disabled state
     const isCrossChainDisabled = isXchainWithdrawDisabled || isXchainSendDisabled
+
+    // When cross-chain withdraw is live, restrict destinations to what Rhino
+    // actually supports — the Squid-era selector lists chains/tokens Rhino
+    // rejects (e.g. USDC on Scroll → "SCROLL is disabled"). See
+    // RHINO_WITHDRAW_SUPPORTED_TOKENS_BY_CHAIN.
+    const restrictToRhino = viewType === 'withdraw' && !isXchainWithdrawDisabled
+    const isRhinoSupported = useCallback(
+        (chainId: string, tokenSymbol: string) =>
+            RHINO_WITHDRAW_SUPPORTED_TOKENS_BY_CHAIN[chainId]?.includes(tokenSymbol.toUpperCase()) ?? false,
+        []
+    )
 
     // state to track content height
     const contentRef = useRef<HTMLDivElement>(null)
@@ -119,7 +142,13 @@ const TokenSelector: React.FC<NewTokenSelectorProps> = ({ classNameButton, viewT
     // selected network name memo, being used ui
     const selectedNetworkName = useMemo(() => {
         if (!selectedChainID) return null
-        return getChainName(selectedChainID) || `Chain ${selectedChainID}`
+        // record first — non-EVM slugs ('solana'/'tron') aren't in the
+        // chain-details-backed getChainName lookup
+        return (
+            supportedChainsAndTokens?.[selectedChainID]?.networkName ||
+            getChainName(selectedChainID) ||
+            `Chain ${selectedChainID}`
+        )
     }, [selectedChainID, supportedChainsAndTokens])
 
     const peanutWalletTokenDetails = useMemo(() => {
@@ -157,7 +186,23 @@ const TokenSelector: React.FC<NewTokenSelectorProps> = ({ classNameButton, viewT
         }
     }
 
-    const allowedChainIds = useMemo(() => new Set(TOKEN_SELECTOR_SUPPORTED_NETWORK_IDS), [])
+    // Withdraw destinations are gated by what Rhino can DELIVER to
+    // (RHINO_WITHDRAW_SUPPORTED_TOKENS_BY_CHAIN), not by the wagmi source-chain
+    // list — the destination needs no wallet connection or balance reads, and
+    // several deliverable chains (Avalanche, Linea, Ink, …) are intentionally
+    // not source chains. Names/icons come from supportedChainsAndTokens.
+    // Per-chain rollout flags (PostHog) gate the newly-added withdraw
+    // destinations on prod so marketing can launch chains one by one.
+    const isChainRolledOut = useChainRollout()
+    const allowedChainIds = useMemo(
+        () =>
+            new Set(
+                restrictToRhino
+                    ? Object.keys(RHINO_WITHDRAW_SUPPORTED_TOKENS_BY_CHAIN).filter(isChainRolledOut)
+                    : TOKEN_SELECTOR_SUPPORTED_NETWORK_IDS
+            ),
+        [restrictToRhino, isChainRolledOut]
+    )
 
     const popularChainsForButtons = useMemo(() => {
         if (!supportedChainsAndTokens) return []
@@ -165,6 +210,8 @@ const TokenSelector: React.FC<NewTokenSelectorProps> = ({ classNameButton, viewT
             const chain = supportedChainsAndTokens[popularNetwork.chainId]
             // skip if the chain ID isn't in supportedChainsAndTokens
             if (!chain) return null
+            // for withdraw, only surface chains Rhino can deliver to
+            if (restrictToRhino && !RHINO_WITHDRAW_SUPPORTED_TOKENS_BY_CHAIN[chain.chainId]) return null
 
             return {
                 chainId: chain.chainId,
@@ -172,31 +219,30 @@ const TokenSelector: React.FC<NewTokenSelectorProps> = ({ classNameButton, viewT
                 iconURI: chain.chainIconURI || '',
             }
         }).filter((chain): chain is { chainId: string; name: string; iconURI: string } => Boolean(chain)) // type guard filter nulls
-    }, [supportedChainsAndTokens])
+    }, [supportedChainsAndTokens, restrictToRhino])
 
     // build list of popular tokens (usdc, usdt, native) for display
     const popularTokensList = useMemo(() => {
-        // when xchain withdraw is disabled, only show USDC on Arbitrum
-        if (isCrossChainDisabled) {
-            if (!supportedChainsAndTokens) return []
+        // USDC on Arbitrum — the always-available token. Uses the loaded token
+        // metadata when present, else a hardcoded entry so the selector is never
+        // empty (e.g. demo mode, or the token list failing to load).
+        const usdcArbitrumEntry = (): IUserBalance => {
             const arbitrumChainId = PEANUT_WALLET_CHAIN.id.toString()
-            const chainData = supportedChainsAndTokens[arbitrumChainId]
-            if (!chainData?.tokens) return []
-
-            const usdcToken = chainData.tokens.find((t) => areEvmAddressesEqual(t.address, PEANUT_WALLET_TOKEN))
-            if (!usdcToken) return []
-
-            return [
-                {
-                    ...usdcToken,
-                    chainId: arbitrumChainId,
-                    amount: 0,
-                    price: 0,
-                    currency: usdcToken.symbol,
-                    value: '',
-                },
-            ]
+            const usdcToken = supportedChainsAndTokens?.[arbitrumChainId]?.tokens?.find((t) =>
+                areEvmAddressesEqual(t.address, PEANUT_WALLET_TOKEN)
+            )
+            const base = usdcToken ?? {
+                address: PEANUT_WALLET_TOKEN,
+                name: PEANUT_WALLET_TOKEN_NAME,
+                symbol: PEANUT_WALLET_TOKEN_SYMBOL,
+                decimals: PEANUT_WALLET_TOKEN_DECIMALS,
+                logoURI: USDC_ARBITRUM_LOGO,
+            }
+            return { ...base, chainId: arbitrumChainId, amount: 0, price: 0, currency: base.symbol, value: '' }
         }
+
+        // when cross-chain is disabled, USDC on Arbitrum is the only allowed token
+        if (isCrossChainDisabled) return [usdcArbitrumEntry()]
 
         const popularSymbolsToFind = ['USDC', 'USDT']
         const createPopularTokenEntry = (token: IToken, chainId: string): IUserBalance => ({
@@ -243,6 +289,9 @@ const TokenSelector: React.FC<NewTokenSelectorProps> = ({ classNameButton, viewT
                 const chainData = supportedChainsAndTokens[chainId]
                 if (chainData?.tokens) {
                     const processToken = (token: IToken) => {
+                        // withdraw: drop tokens Rhino can't deliver on this chain
+                        // (e.g. native POL/xDAI, any token on a disabled chain).
+                        if (restrictToRhino && !isRhinoSupported(chainId, token.symbol)) return
                         if (filterSymbol) {
                             if (
                                 token.symbol.toUpperCase() === filterSymbol.toUpperCase() ||
@@ -263,24 +312,49 @@ const TokenSelector: React.FC<NewTokenSelectorProps> = ({ classNameButton, viewT
                     chainData.tokens.forEach(processToken)
                 }
             })
-            const uniqueTokens = Array.from(
-                new Map(tokens.map((t) => [`${t.address.toLowerCase()}-${t.chainId}`, t])).values()
-            )
+            // Dedupe by address normally; for the Rhino-restricted withdraw list
+            // collapse per (symbol, chain) so chains with two same-symbol variants
+            // (e.g. native USDC + bridged USDC.e on Optimism) show a single entry —
+            // Rhino resolves the token by symbol anyway. Keep the FIRST occurrence
+            // (token data lists the native/canonical token before bridged variants).
+            const seenKeys = new Set<string>()
+            const uniqueTokens = tokens.filter((t) => {
+                const key = restrictToRhino
+                    ? `${t.symbol.toUpperCase()}-${t.chainId}`
+                    : `${t.address.toLowerCase()}-${t.chainId}`
+                if (seenKeys.has(key)) return false
+                seenKeys.add(key)
+                return true
+            })
             return sortTokensByPriority(uniqueTokens)
         }
 
         if (searchValue) {
-            // search active: show searched token across ALL supported networks
-            return buildTokensForChainArray(TOKEN_SELECTOR_SUPPORTED_NETWORK_IDS, searchValue)
+            // search active: show searched token across all networks selectable
+            // in this mode — the Rhino destination set for withdraw (which
+            // includes destination-only chains like Linea/Avalanche), the wagmi
+            // source list otherwise.
+            return buildTokensForChainArray(Array.from(allowedChainIds), searchValue)
         }
-        if (selectedChainID) {
-            // specific chain selected: show popular (USDC, USDT, Native) for that chain
-            return buildTokensForChainArray([selectedChainID])
-        }
-        // default: popular tokens on popular chains
-        const popularChainIds = popularChainsForButtons.map((pc) => pc.chainId)
-        return buildTokensForChainArray(popularChainIds)
-    }, [searchValue, selectedChainID, supportedChainsAndTokens, popularChainsForButtons, isCrossChainDisabled])
+
+        const result = selectedChainID
+            ? // specific chain selected: show popular (USDC, USDT, Native) for that chain
+              buildTokensForChainArray([selectedChainID])
+            : // default: popular tokens on popular chains
+              buildTokensForChainArray(popularChainsForButtons.map((pc) => pc.chainId))
+
+        // never leave the selector empty — USDC on Arbitrum is always usable
+        return result.length > 0 ? result : [usdcArbitrumEntry()]
+    }, [
+        searchValue,
+        selectedChainID,
+        supportedChainsAndTokens,
+        popularChainsForButtons,
+        isCrossChainDisabled,
+        restrictToRhino,
+        isRhinoSupported,
+        allowedChainIds,
+    ])
 
     // filter popular tokens by search
     const filteredPopularTokensToDisplay = useMemo(() => {
@@ -391,7 +465,7 @@ const TokenSelector: React.FC<NewTokenSelectorProps> = ({ classNameButton, viewT
                                 setSearchValue={setNetworkSearchValue}
                                 selectedChainID={selectedChainID}
                                 allowedChainIds={allowedChainIds}
-                                comingSoonNetworks={TOKEN_SELECTOR_COMING_SOON_NETWORKS}
+                                comingSoonNetworks={restrictToRhino ? [] : TOKEN_SELECTOR_COMING_SOON_NETWORKS}
                             />
                         ) : (
                             <div className="relative flex flex-col space-y-4">

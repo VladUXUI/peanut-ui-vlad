@@ -2,9 +2,15 @@
 
 import { useWallet } from '@/hooks/wallet/useWallet'
 import { useSignSpendBundle } from '@/hooks/wallet/useSignSpendBundle'
-import { InsufficientSpendableError, SessionKeyGrantRequiredError } from '@/hooks/wallet/useSpendBundle'
+import { useStaleSessionGuard } from '@/hooks/wallet/useStaleSessionGuard'
+import { InsufficientSpendableError, SessionKeyGrantRequiredError } from '@/hooks/wallet/spendPreflight'
 import { rainCollateralErrorMessage } from '@/utils/friendly-error.utils'
-import { rainSpendingPowerToWei } from '@/utils/balance.utils'
+import {
+    rainCentsToUsdcUnits,
+    INSUFFICIENT_BALANCE_MESSAGE,
+    BALANCE_SETTLING_MESSAGE,
+    isAmountWithinBalance,
+} from '@/utils/balance.utils'
 import { useRainCardOverview } from '@/hooks/useRainCardOverview'
 import { useState, useMemo, useContext, useEffect, useCallback, useId } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
@@ -17,29 +23,24 @@ import { Icon } from '@/components/Global/Icons/Icon'
 import PeanutLoading from '@/components/Global/PeanutLoading'
 import { mantecaApi, type WithdrawPriceLock } from '@/services/manteca'
 import { useCurrency } from '@/hooks/useCurrency'
-import { loadingStateContext } from '@/context'
+import { loadingStateContext } from '@/context/loadingStates.context'
 import { countryData } from '@/components/AddMoney/consts'
 import { getFlagUrl } from '@/constants/countryCurrencyMapping'
 import Image from 'next/image'
-import { formatAmount, formatNumberForDisplay } from '@/utils/general.utils'
-import {
-    validateCbuCvuAlias,
-    validatePixKey,
-    normalizePixPhoneNumber,
-    isPixPhoneNumber,
-    isPixEmvcoQr,
-} from '@/utils/withdraw.utils'
+import { formatNumberForDisplay } from '@/utils/general.utils'
+import { validateCbuCvuAlias, validatePixKey, normalizePixInput, isPixEmvcoQr } from '@/utils/withdraw.utils'
 import ValidatedInput from '@/components/Global/ValidatedInput'
 import AmountInput from '@/components/Global/AmountInput'
-import { formatUnits, parseUnits } from 'viem'
+import { parseUnits } from 'viem'
 import { PaymentInfoRow } from '@/components/Payment/PaymentInfoRow'
 import { useModalsContext } from '@/context/ModalsContext'
 import Select from '@/components/Global/Select'
 import { SoundPlayer } from '@/components/Global/SoundPlayer'
 import { useQueryClient } from '@tanstack/react-query'
 import { captureException } from '@sentry/nextjs'
-import useKycStatus from '@/hooks/useKycStatus'
-import useProviderRejectionStatus from '@/hooks/useProviderRejectionStatus'
+import { useCapabilities } from '@/hooks/useCapabilities'
+import { useIdentityVerification } from '@/hooks/useIdentityVerification'
+import { deriveProviderRejection } from '@/utils/provider-rejection.utils'
 import { useMultiPhaseKycFlow } from '@/hooks/useMultiPhaseKycFlow'
 import { SumsubKycModals } from '@/components/Kyc/SumsubKycModals'
 import { InitiateKycModal } from '@/components/Kyc/InitiateKycModal'
@@ -52,6 +53,7 @@ import {
     MANTECA_COUNTRIES_CONFIG,
     MANTECA_DEPOSIT_ADDRESS,
     MantecaAccountType,
+    isMantecaSupportedCountryCode,
     type MantecaBankCode,
 } from '@/constants/manteca.consts'
 import { PEANUT_WALLET_CHAIN, PEANUT_WALLET_TOKEN_DECIMALS } from '@/constants/zerodev.consts'
@@ -67,11 +69,36 @@ import { useSumsubActionFlow } from '@/hooks/useSumsubActionFlow'
 import { initiateIncreaseLimits } from '@/app/actions/increase-limits'
 import { SumsubKycWrapper } from '@/components/Kyc/SumsubKycWrapper'
 import { useLimits } from '@/hooks/useLimits'
-import { useIdentityVerification } from '@/hooks/useIdentityVerification'
+import { isVerifiedForCountry } from '@/utils/regions.utils'
+import PixKeySendView from '@/components/Withdraw/views/PixKeySend.view'
+import underMaintenanceConfig from '@/config/underMaintenance.config'
+import { MantecaTransfersMaintenanceView } from '@/components/Global/Banner/MantecaTransfersMaintenanceView'
 
 type MantecaWithdrawStep = 'amountInput' | 'bankDetails' | 'review' | 'success' | 'failure'
 
 export default function MantecaWithdrawFlow() {
+    const searchParams = useSearchParams()
+    // Brazil PIX sends go through the Manteca QR-payment endpoint (send to any
+    // PIX key), not the offramp/withdraw endpoint. Delegate to the lightweight
+    // PIX-key entry, which wraps the key and hands off to /qr-pay. The gate
+    // there (canDo('pay', { provider: 'manteca' })) is broader than the full
+    // Manteca KYC the withdraw flow requires — so PIX-pay-capable users get
+    // through. All Brazil-PIX entry points funnel here, so this is the single
+    // chokepoint that flips the endpoint without touching the AR / bank paths.
+    if (searchParams.get('country') === 'brazil' && searchParams.get('method') === 'pix') {
+        return <PixKeySendView destinationParam={searchParams.get('destination')} />
+    }
+    // Manteca provider outage — block the offramp only for currencies still
+    // down. Placed AFTER the Brazil-PIX delegation so PIX-over-QR sends (which
+    // ride the QR-payment endpoint, not Manteca offramp) stay open.
+    const withdrawCurrency = countryData.find((c) => c.path === searchParams.get('country'))?.currency?.toUpperCase()
+    if (withdrawCurrency && (underMaintenanceConfig.disabledMantecaCurrencies as string[]).includes(withdrawCurrency)) {
+        return <MantecaTransfersMaintenanceView action="withdrawals" />
+    }
+    return <MantecaBankWithdrawFlow />
+}
+
+function MantecaBankWithdrawFlow() {
     const flowId = useId() // Unique ID per flow instance to prevent cache collisions
     const [currencyAmount, setCurrencyAmount] = useState<string | undefined>(undefined)
     const [usdAmount, setUsdAmount] = useState<string | undefined>(undefined)
@@ -92,15 +119,18 @@ export default function MantecaWithdrawFlow() {
     const [priceLock, setPriceLock] = useState<WithdrawPriceLock | null>(null)
     const [isLockingPrice, setIsLockingPrice] = useState(false)
     const router = useRouter()
-    const { spendableBalance: balance, balance: smartBalance } = useWallet()
+    const { spendableBalance: balance, formattedSpendableBalance } = useWallet()
     const { signSpend } = useSignSpendBundle()
+    const handleStaleSession = useStaleSessionGuard()
     const { overview: rainCardOverview } = useRainCardOverview()
     const { isLoading, loadingState, setLoadingState } = useContext(loadingStateContext)
     const { setIsSupportModalOpen, openSupportWithMessage } = useModalsContext()
     const queryClient = useQueryClient()
-    const { isUserSumsubKycApproved } = useKycStatus()
-    const { isVerifiedForCountry } = useIdentityVerification()
-    const { manteca: mantecaRejection } = useProviderRejectionStatus()
+    // The pool→full upgrade gate reads identityVerification (Sumsub-cleared
+    // the human), not rail-approval. Same fix-pattern as Profile/ProfileEdit.
+    const { rails } = useCapabilities()
+    const { isVerified: isUserIdentityVerified } = useIdentityVerification()
+    const mantecaRejection = useMemo(() => deriveProviderRejection(rails, 'MANTECA'), [rails])
     const { hasPendingTransactions } = usePendingTransactions()
 
     // inline sumsub kyc flow for manteca users who need LATAM verification
@@ -124,16 +154,16 @@ export default function MantecaWithdrawFlow() {
     const onBack = useSafeBack(withdrawCountryUrl(selectedCountry?.path || ''))
 
     const countryConfig = useMemo(() => {
-        if (!selectedCountry) return undefined
+        if (!selectedCountry || !isMantecaSupportedCountryCode(selectedCountry.id)) return undefined
         return MANTECA_COUNTRIES_CONFIG[selectedCountry.id]
     }, [selectedCountry])
-    const isUserMantecaKycApprovedForCountry = selectedCountry ? isVerifiedForCountry(selectedCountry.id) : false
+    const isUserMantecaKycApprovedForCountry = selectedCountry ? isVerifiedForCountry(rails, selectedCountry.id) : false
 
     const {
         code: currencyCode,
         price: currencyPrice,
         isLoading: isCurrencyLoading,
-    } = useCurrency(selectedCountry?.currency!)
+    } = useCurrency(selectedCountry?.currency ?? null)
 
     // validates withdrawal against user's limits
     // currency comes from country config - hook normalizes it internally
@@ -204,6 +234,19 @@ export default function MantecaWithdrawFlow() {
     /**
      * Detect Manteca onboarding-incomplete errors and redirect user to complete their profile.
      * Returns true if the error was handled (caller should return early).
+     *
+     * INTENTIONAL FALLBACK — NOT a primary code path. The KYC 2.0 architecture
+     * (engineering/projects/kyc-2.0/final-plan.md) centralizes all data
+     * collection in Sumsub and submits to Manteca via the API (`submitToManteca`
+     * in peanut-api-ts). The Manteca hosted onboarding widget is dead-by-design
+     * — but we keep this last-resort redirect for the long tail of users who
+     * land in an incomplete Manteca state (partial provisioning, undelivered
+     * initial-onboarding API call). Without this escape hatch they'd be stuck
+     * at withdraw time with no actionable error.
+     *
+     * Right fix: root-cause why `submitToManteca` sometimes leaves users
+     * half-onboarded, fix that, delete this fallback + `/manteca/initiate-onboarding`
+     * route + `mantecaApi.initiateOnboarding` client. Tracked separately.
      */
     const handleOnboardingError = useCallback(async (error: string): Promise<boolean> => {
         const onboardingErrorPatterns = ['fund origin', 'profile incomplete', 'onboarding required']
@@ -323,14 +366,13 @@ export default function MantecaWithdrawFlow() {
                 signedArtifact = await signSpend({
                     requiredUsdcAmount,
                     recipient: MANTECA_DEPOSIT_ADDRESS,
-                    smartBalance: smartBalance ?? 0n,
-                    rainSpendingPower: rainSpendingPowerToWei(rainCardOverview?.balance?.spendingPower),
+                    rainSpendingPower: rainCentsToUsdcUnits(rainCardOverview?.balance?.spendingPower),
                     kind: 'FIAT_OFFRAMP',
                 })
             } catch (error) {
                 const rainMsg = rainCollateralErrorMessage(error)
                 if (error instanceof InsufficientSpendableError) {
-                    setErrorMessage('Not enough USDC in your wallet or card to cover this withdrawal.')
+                    setErrorMessage(BALANCE_SETTLING_MESSAGE)
                 } else if (error instanceof SessionKeyGrantRequiredError) {
                     // Grant prompt was attempted inside signSpend and failed.
                     // Telling the user "you'll be asked" is misleading — they
@@ -393,6 +435,10 @@ export default function MantecaWithdrawFlow() {
                     error_message: result.error,
                 })
 
+                // Wrong-passkey session: backend rejected the signed UserOp with
+                // AA24 / wapk. Unrecoverable without re-auth — force a clean logout.
+                if (handleStaleSession(result.message ?? result.error)) return
+
                 // handle onboarding-incomplete errors by redirecting to complete profile
                 if (await handleOnboardingError(result.message ?? result.error)) return
 
@@ -416,6 +462,7 @@ export default function MantecaWithdrawFlow() {
             })
         } catch (error) {
             console.error('Manteca withdraw error:', error)
+            if (handleStaleSession(error)) return
             posthog.capture(ANALYTICS_EVENTS.WITHDRAW_FAILED, {
                 method_type: 'manteca',
                 error_message: 'Withdraw failed unexpectedly',
@@ -463,8 +510,10 @@ export default function MantecaWithdrawFlow() {
         // only check min amount and balance here - max amount is handled by limits validation
         if (paymentAmount < parseUnits(MIN_MANTECA_WITHDRAW_AMOUNT.toString(), PEANUT_WALLET_TOKEN_DECIMALS)) {
             setBalanceErrorMessage(`Withdraw amount must be at least $${MIN_MANTECA_WITHDRAW_AMOUNT}`)
-        } else if (paymentAmount > balance) {
-            setBalanceErrorMessage('Not enough balance to complete withdrawal.')
+        } else if (!isAmountWithinBalance(usdAmount, balance)) {
+            // gate on the displayed total; an in-transit shortfall passes here and
+            // fails late with the settling message at execution.
+            setBalanceErrorMessage(INSUFFICIENT_BALANCE_MESSAGE)
         } else {
             setBalanceErrorMessage(null)
         }
@@ -485,7 +534,7 @@ export default function MantecaWithdrawFlow() {
 
     // redirect to withdraw page if country is missing or not supported by manteca
     useEffect(() => {
-        if (!countryFromUrl || !selectedCountry || !MANTECA_COUNTRIES_CONFIG[selectedCountry.id]) {
+        if (!countryFromUrl || !selectedCountry || !isMantecaSupportedCountryCode(selectedCountry.id)) {
             router.replace('/withdraw')
         }
     }, [countryFromUrl, selectedCountry, router])
@@ -574,14 +623,19 @@ export default function MantecaWithdrawFlow() {
                 onVerify={async () => {
                     if (mantecaRejection.state === 'blocked') {
                         // blocked users cannot self-heal — route to support
-                        if (typeof window !== 'undefined' && (window as any).$crisp) {
-                            ;(window as any).$crisp.push(['do', 'chat:open'])
+                        const crisp =
+                            typeof window !== 'undefined'
+                                ? (window as Window & { $crisp?: string[][] }).$crisp
+                                : undefined
+                        if (crisp) {
+                            crisp.push(['do', 'chat:open'])
                         }
                         setShowKycModal(false)
                         return
                     }
-                    const hasRejection = mantecaRejection.state === 'fixable'
-                    if (hasRejection) {
+                    if (mantecaRejection.state === 'restart-identity') {
+                        await sumsubFlow.handleRestartIdentity()
+                    } else if (mantecaRejection.state === 'fixable') {
                         await sumsubFlow.handleSelfHealResubmit('MANTECA')
                     } else {
                         await sumsubFlow.handleInitiateKyc('LATAM', undefined, true, selectedCountry?.id)
@@ -590,11 +644,15 @@ export default function MantecaWithdrawFlow() {
                 }}
                 isLoading={sumsubFlow.isLoading}
                 variant={
-                    mantecaRejection.state === 'fixable' || mantecaRejection.state === 'blocked'
-                        ? 'provider_rejection'
-                        : isUserSumsubKycApproved
-                          ? 'cross_region'
-                          : 'default'
+                    mantecaRejection.state === 'blocked'
+                        ? 'blocked'
+                        : mantecaRejection.state === 'restart-identity'
+                          ? 'restart_identity'
+                          : mantecaRejection.state === 'fixable'
+                            ? 'provider_rejection'
+                            : isUserIdentityVerified
+                              ? 'cross_region'
+                              : 'default'
                 }
                 providerMessage={mantecaRejection.userMessage ?? undefined}
                 regionName={selectedCountry?.title}
@@ -606,7 +664,6 @@ export default function MantecaWithdrawFlow() {
                 onClose={limitIncreaseFlow.handleClose}
                 onComplete={limitIncreaseFlow.handleSdkComplete}
                 onRefreshToken={limitIncreaseFlow.refreshToken}
-                autoStart
                 isMultiLevel
             />
             <NavHeader
@@ -645,9 +702,7 @@ export default function MantecaWithdrawFlow() {
                             price: 1,
                             decimals: 2,
                         }}
-                        walletBalance={
-                            balance ? formatAmount(formatUnits(balance, PEANUT_WALLET_TOKEN_DECIMALS)) : undefined
-                        }
+                        walletBalance={balance !== undefined ? formattedSpendableBalance : undefined}
                     />
 
                     {/* limits warning/error card - uses centralized helper for props */}
@@ -715,7 +770,7 @@ export default function MantecaWithdrawFlow() {
                             </div>
                             <div>
                                 <p className="flex items-center gap-1 text-center text-sm text-gray-600">
-                                    <Icon name="arrow-up" size={10} /> You're sending
+                                    <Icon name="arrow-up" size={10} /> You're withdrawing
                                 </p>
                                 <p className="text-2xl font-bold">
                                     {currencyCode} {formatNumberForDisplay(currencyAmount, { maxDecimals: 2 })}
@@ -736,15 +791,8 @@ export default function MantecaWithdrawFlow() {
                                 placeholder={countryConfig!.accountNumberLabel}
                                 onUpdate={(update) => {
                                     // Auto-normalize PIX keys for Brazil: strip whitespace and normalize phone numbers
-                                    let normalizedValue = update.value
-                                    if (countryPath === 'brazil') {
-                                        normalizedValue = isPixEmvcoQr(normalizedValue.trim())
-                                            ? normalizedValue.trim()
-                                            : normalizedValue.replace(/\s/g, '')
-                                        if (isPixPhoneNumber(normalizedValue)) {
-                                            normalizedValue = normalizePixPhoneNumber(normalizedValue)
-                                        }
-                                    }
+                                    const normalizedValue =
+                                        countryPath === 'brazil' ? normalizePixInput(update.value) : update.value
                                     setDestinationAddress(normalizedValue)
                                     setIsDestinationAddressValid(update.isValid)
                                     setIsDestinationAddressChanging(update.isChanging)
@@ -831,7 +879,7 @@ export default function MantecaWithdrawFlow() {
                             </div>
                             <div>
                                 <p className="flex items-center gap-1 text-center text-sm text-gray-600">
-                                    <Icon name="arrow-up" size={10} /> You're sending
+                                    <Icon name="arrow-up" size={10} /> You're withdrawing
                                 </p>
                                 <p className="text-2xl font-bold">
                                     {currencyCode}{' '}
@@ -860,7 +908,8 @@ export default function MantecaWithdrawFlow() {
                         icon="arrow-up"
                         onClick={handleWithdraw}
                         loading={isLoading}
-                        disabled={!!errorMessage || isLoading}
+                        // settling failure is retryable — don't dead-end the button on it
+                        disabled={(!!errorMessage && errorMessage !== BALANCE_SETTLING_MESSAGE) || isLoading}
                         shadowSize="4"
                     >
                         {isLoading ? loadingState : 'Withdraw'}

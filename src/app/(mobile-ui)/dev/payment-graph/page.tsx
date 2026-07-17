@@ -74,6 +74,12 @@ export default function PaymentGraphPage() {
         )
     }
 
+    // Deep-link focus: ?user=<username> seeds the camera/highlight on a specific
+    // node. Used by Discord live-log links and any other "show me this user's
+    // network" entry point. The InvitesGraph component resolves username → node.id
+    // once after data loads (case-insensitive), then behaves normally on clicks.
+    const initialFocusUsername = searchParams.get('user') ?? undefined
+
     return (
         <div className="fixed inset-0 z-50 flex flex-col bg-gray-50">
             <InvitesGraph
@@ -82,6 +88,7 @@ export default function PaymentGraphPage() {
                 mode="payment"
                 topNodes={5000}
                 performanceMode={performanceMode}
+                initialFocusUsername={initialFocusUsername}
                 onClose={handleClose}
                 width={typeof window !== 'undefined' ? window.innerWidth : 1200}
                 height={typeof window !== 'undefined' ? window.innerHeight - 120 : 800}
@@ -100,7 +107,7 @@ export default function PaymentGraphPage() {
                 }) => (
                     <>
                         {/* Controls Panel - Top Right */}
-                        <div className="absolute right-4 top-4 max-h-[calc(100vh-140px)] w-[200px] overflow-y-auto rounded-xl bg-white/95 p-3 shadow-lg backdrop-blur-sm">
+                        <div className="absolute right-4 top-4 max-h-[calc(100vh_-_140px)] w-[200px] overflow-y-auto rounded-xl bg-white/95 p-3 shadow-lg backdrop-blur-sm">
                             <h3 className="mb-2 text-xs font-bold text-gray-900">Display & Forces</h3>
 
                             <div className="space-y-2 text-[11px]">
